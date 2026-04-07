@@ -15,6 +15,7 @@ description = "Hackathon environment for OpenEnv"
 requires-python = ">=3.10"
 dependencies = [
     "gradio>=6.10.0",
+    "huggingface-hub>=1.8.0",
     "langchain>=1.2.15",
     "langchain-community>=0.4.1",
     "langchain-openai>=1.1.12",
