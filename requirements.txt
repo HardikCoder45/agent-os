@@ -1,6 +1,6 @@
-# Core - compatible versions
+# Core - exact compatible versions
 gradio==4.44.0
-huggingface-hub>=0.19.0
+huggingface-hub==0.24.7
 pydantic
 requests
 
