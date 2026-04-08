@@ -1,15 +1,4 @@
-# LangChain / LangGraph
-langchain
-langchain-openai
-langchain-community
-langgraph
-
-# OpenEnv
-openenv-core
-
-# Other deps
-pydantic
-requests
-orjson
-matplotlib
-numpy<2.0.0
+openai>=1.75.0
+openenv-core[core]>=0.2.2
+pydantic>=2.12.5
+requests>=2.33.1

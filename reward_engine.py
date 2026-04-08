@@ -14,6 +14,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from judge_engine import run_llm_judge, FinalVerdict
+from task_graders import grade_task_action
 
 # ──────────────────────────────────────────────
 #  J1: Fast rule-based scorer
@@ -115,21 +116,24 @@ def j1_score(
 #  Combined reward
 # ──────────────────────────────────────────────
 
-J1_WEIGHT = 0.30
-LLM_WEIGHT = 0.70
+RULE_WEIGHT = 0.75
+LLM_WEIGHT = 0.25
 
 
 def compute_reward(
     agent_output: str,
     tool_name: str,
     args: Dict,
+    reasoning: str,
     available_tools: List[str],
     tool_registry: Dict[str, Any],
     scenario: Dict[str, Any],
     step_context: Dict[str, Any],
     previous_actions: List[Dict],
+    task: Any = None,
     rubric: Optional[Dict] = None,
-    openrouter_key: Optional[str] = None,
+    api_key: Optional[str] = None,
+    api_base_url: Optional[str] = None,
     judge_model: str = "anthropic/claude-3.5-sonnet",
     use_llm_judge: bool = True,
 ) -> Tuple[float, Dict[str, Any]]:
@@ -139,20 +143,36 @@ def compute_reward(
     Returns:
       (final_reward ∈ [0, 1], detail_dict)
     """
-    j1, j1_reasons = j1_score(agent_output, tool_name, args, available_tools, rubric)
+    task_grade: Optional[Dict[str, Any]] = None
+    if task is not None:
+        task_grade = grade_task_action(
+            task,
+            tool_name=tool_name,
+            args=args,
+            reasoning=reasoning,
+            available_tools=available_tools,
+            tool_schema=tool_registry.get(tool_name),
+        )
+        base_score = task_grade["final_reward"]
+        j1 = base_score
+        j1_reasons = task_grade.get("notes", []) + task_grade.get("errors", [])
+    else:
+        j1, j1_reasons = j1_score(agent_output, tool_name, args, available_tools, rubric)
+        base_score = j1
 
     # Hard gate: J1 zero means instant zero overall
-    if j1 == 0.0:
+    if base_score == 0.0:
         return 0.0, {
             "j1_score": 0.0,
             "j1_reasons": j1_reasons,
+            "deterministic_grade": task_grade,
             "llm_verdict": None,
             "final_reward": 0.0,
-            "method": "j1_instant_zero",
+            "method": "task_instant_zero" if task_grade else "j1_instant_zero",
         }
 
     llm_verdict: Optional[FinalVerdict] = None
-    if use_llm_judge and openrouter_key:
+    if use_llm_judge and api_key and api_base_url:
         try:
             llm_verdict = run_llm_judge(
                 agent_output=agent_output,
@@ -161,32 +181,35 @@ def compute_reward(
                 step_context=step_context,
                 available_tools=available_tools,
                 previous_actions=previous_actions,
-                api_key=openrouter_key,
+                api_key=api_key,
+                api_base_url=api_base_url,
                 model=judge_model,
             )
-        except Exception as e:
+        except Exception:
             llm_verdict = None
 
     if llm_verdict is not None:
         if llm_verdict.instant_zero:
             return 0.0, {
-                "j1_score": j1,
+                "j1_score": base_score,
                 "j1_reasons": j1_reasons,
-                "llm_verdict": llm_verdict.dict(),
+                "deterministic_grade": task_grade,
+                "llm_verdict": llm_verdict.model_dump(),
                 "final_reward": 0.0,
                 "method": "llm_instant_zero",
             }
         llm_score = llm_verdict.total_score
-        final = round(J1_WEIGHT * j1 + LLM_WEIGHT * llm_score, 4)
-        method = "combined_j1_llm"
+        final = round(RULE_WEIGHT * base_score + LLM_WEIGHT * llm_score, 4)
+        method = "combined_task_llm" if task_grade else "combined_j1_llm"
     else:
-        final = j1
-        method = "j1_only"
+        final = base_score
+        method = "task_only" if task_grade else "j1_only"
 
     return final, {
-        "j1_score": j1,
+        "j1_score": base_score,
         "j1_reasons": j1_reasons,
-        "llm_verdict": llm_verdict.dict() if llm_verdict else None,
+        "deterministic_grade": task_grade,
+        "llm_verdict": llm_verdict.model_dump() if llm_verdict else None,
         "final_reward": final,
         "method": method,
     }

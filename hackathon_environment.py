@@ -1,317 +1,286 @@
-"""
-server/hackathon_environment.py — OpenEnv-compatible environment.
-
-Wired to:
-  - reward_engine.compute_reward (J1 + LLM judge)
-  - mcp_client for tool extensions
-  - LangGraph structured outputs
-
-OpenEnv contract:
-  reset() → Observation
-  step(action) → StepResult
-  state() → State
-"""
-
 from __future__ import annotations
 
-import os
 import json
-import time
-import uuid
+import os
 from typing import Any, Dict, List, Optional
+from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import Field
 
-# OpenEnv base types (from openenv-core)
-try:
-    from openenv import BaseEnvironment, BaseAction, BaseObservation, BaseState
-    OPENENV_AVAILABLE = True
-except ImportError:
-    OPENENV_AVAILABLE = False
-    # Stubs
-    class BaseAction(BaseModel): pass
-    class BaseObservation(BaseModel): pass
-    class BaseState(BaseModel): pass
-    class BaseEnvironment:
-        def reset(self, **kwargs): raise NotImplementedError
-        def step(self, action): raise NotImplementedError
-        def state(self): raise NotImplementedError
-
-try:
-    from reward_engine import compute_reward
-    from mcp_client import get_mcp_client
-    from situations import SITUATIONS
-    from agents import AGENT_REGISTRY
-except ImportError:
-    compute_reward = None
-    get_mcp_client = None
-    SITUATIONS = {}
-    AGENT_REGISTRY = {}
+from benchmark_tasks import BENCHMARK_NAME, get_task, list_tasks
+from openenv.core.env_server.interfaces import Environment
+from openenv.core.env_server.types import Action, EnvironmentMetadata, Observation, State
+from reward_engine import compute_reward
+from task_graders import grade_episode
+from tool_schemas import get_tools_for_role
 
 
-# ──────────────────────────────────────────────
-#  OpenEnv data models
-# ──────────────────────────────────────────────
-
-class HackathonAction(BaseAction):
-    tool: str = Field(..., description="Name of the tool to invoke")
-    args: Dict[str, Any] = Field(default_factory=dict, description="Tool arguments")
-    reasoning: str = Field(default="", description="Agent's reasoning before taking action")
+class HackathonAction(Action):
+    tool: str = Field(..., description="Tool name to execute for the current task")
+    args: Dict[str, Any] = Field(default_factory=dict, description="Structured arguments for the tool")
+    reasoning: str = Field(default="", description="Strategic reasoning before the action")
 
 
-class HackathonObservation(BaseObservation):
-    text: str = Field(..., description="Human-readable observation")
-    step: int = Field(0, description="Current step number")
-    max_steps: int = Field(8, description="Max steps in episode")
-    available_tools: List[str] = Field(default_factory=list)
-    scenario_context: Dict[str, Any] = Field(default_factory=dict)
-    reward_breakdown: Dict[str, Any] = Field(default_factory=dict)
-    done: bool = False
+class HackathonObservation(Observation):
+    text: str = Field(..., description="Human-readable task status")
+    task_id: str = Field(..., description="Unique benchmark task identifier")
+    task_name: str = Field(..., description="Task slug")
+    domain: str = Field(..., description="Domain for the task")
+    role: str = Field(..., description="Role expected to act")
+    question: str = Field(..., description="Question the agent must answer")
+    context: str = Field(..., description="Task context block")
+    step: int = Field(default=0, description="Current 1-based step index")
+    max_steps: int = Field(default=1, description="Maximum steps allowed")
+    available_tools: List[str] = Field(default_factory=list, description="Role-specific tools")
+    scenario_context: Dict[str, Any] = Field(default_factory=dict, description="Scenario payload")
+    reward_breakdown: Dict[str, Any] = Field(default_factory=dict, description="Detailed grader output")
+    counterfactual_tip: str = Field(default="", description="Reference strategy for the task")
 
 
-class HackathonState(BaseState):
-    episode_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+class HackathonState(State):
+    task_id: str = ""
+    task_name: str = ""
     domain: str = ""
     role: str = ""
-    step: int = 0
-    max_steps: int = 8
-    scenario: Dict[str, Any] = Field(default_factory=dict)
-    action_history: List[Dict] = Field(default_factory=list)
+    scenario_id: str = ""
+    scenario_title: str = ""
+    max_steps: int = 1
     cumulative_reward: float = 0.0
+    last_reward: float = 0.0
     done: bool = False
-    openrouter_key: Optional[str] = None
-    judge_model: str = "anthropic/claude-3.5-sonnet"
-    use_llm_judge: bool = True
+    action_history: List[Dict[str, Any]] = Field(default_factory=list)
+    available_tools: List[str] = Field(default_factory=list)
+    scenario_context: Dict[str, Any] = Field(default_factory=dict)
+    api_base_url: Optional[str] = None
+    api_key: Optional[str] = None
+    judge_model: Optional[str] = None
+    use_llm_judge: bool = False
 
 
-# ──────────────────────────────────────────────
-#  Environment
-# ──────────────────────────────────────────────
-
-class HackathonEnvironment(BaseEnvironment):
-    """
-    Multi-domain AI agent environment for reinforcement learning.
-
-    Reward signal:
-      - J1 rule-based (30%): tool validity, reasoning keywords, format
-      - LLM judge (70%): tool validity, reasoning quality, task alignment,
-                          strategic quality, risk/safety (via judge_engine.py)
-
-    Hard rules (instant 0):
-      - Non-existent tool called
-      - Empty agent output
-      - LLM judge disqualification
-    """
+class HackathonEnvironment(Environment[HackathonAction, HackathonObservation, HackathonState]):
+    SUPPORTS_CONCURRENT_SESSIONS = True
 
     def __init__(
         self,
-        domain: str = "Sales",
-        role: str = "CEO",
-        max_steps: int = 8,
-        openrouter_key: Optional[str] = None,
-        judge_model: str = "anthropic/claude-3.5-sonnet",
-        use_llm_judge: bool = True,
-        enable_mcp: bool = False,
+        *,
+        task_id: Optional[str] = None,
+        api_base_url: Optional[str] = None,
+        api_key: Optional[str] = None,
+        judge_model: Optional[str] = None,
+        use_llm_judge: bool = False,
     ):
+        super().__init__()
+        self._task = get_task(task_id)
         self._state = HackathonState(
-            domain=domain,
-            role=role,
-            max_steps=max_steps,
-            openrouter_key=openrouter_key or os.environ.get("OPENROUTER_API_KEY"),
-            judge_model=judge_model,
+            episode_id=str(uuid4()),
+            task_id=self._task.id,
+            task_name=self._task.name,
+            domain=self._task.domain,
+            role=self._task.role,
+            scenario_id=self._task.scenario_id,
+            scenario_title=self._task.scenario_title,
+            max_steps=self._task.max_steps,
+            available_tools=list(self._tools().keys()),
+            scenario_context=self._scenario_context(self._task),
+            api_base_url=api_base_url or os.environ.get("API_BASE_URL"),
+            api_key=api_key or os.environ.get("HF_TOKEN"),
+            judge_model=judge_model or os.environ.get("MODEL_NAME"),
             use_llm_judge=use_llm_judge,
         )
-        self._enable_mcp = enable_mcp
 
-    # ── Helpers ──────────────────────────────
+    def _tools(self) -> Dict[str, Any]:
+        return get_tools_for_role(self._task.role, self._task.domain)
 
-    def _get_tools(self) -> Dict[str, Any]:
-        try:
-            from tool_schemas import TOOL_REGISTRY
-            tools = TOOL_REGISTRY.get_tools_for_role(self._state.role) or {}
-        except Exception:
-            tools = {}
+    def _scenario_context(self, task) -> Dict[str, Any]:
+        return {
+            "benchmark": BENCHMARK_NAME,
+            "task_id": task.id,
+            "scenario_title": task.scenario_title,
+            "briefing": task.briefing,
+            "goal": task.goal,
+            "question": task.question,
+            "context": task.context,
+            "required_tool": task.required_tool,
+            "required_args_hints": task.required_args_hints,
+            "success_threshold": task.success_threshold,
+        }
 
-        if self._enable_mcp and get_mcp_client:
-            mcp = get_mcp_client()
-            for t in mcp.get_all_tools():
-                tools[t.name] = t.to_display_dict()
-        return tools
-
-    def _get_scenario(self) -> Dict[str, Any]:
-        domain_situations = SITUATIONS.get(self._state.domain, {})
-        if domain_situations:
-            import random
-            key = random.choice(list(domain_situations.keys()))
-            return domain_situations[key]
-        return {"title": f"{self._state.domain} Scenario", "description": "Complete domain objectives."}
-
-    def _build_observation_text(self, extra: str = "") -> str:
-        s = self._state
-        scenario = s.scenario
-        tools = self._get_tools()
-        tool_list = ", ".join(f"`{t}`" for t in tools.keys()) if tools else "(none)"
-
+    def _build_text(self, *, extra: str = "") -> str:
+        tools = ", ".join(f"`{name}`" for name in self._state.available_tools) or "(none)"
         lines = [
-            f"**Episode:** {s.episode_id[:8]}  |  **Step:** {s.step + 1}/{s.max_steps}",
-            f"**Domain:** {s.domain}  |  **Role:** {s.role}",
+            f"# {self._task.scenario_title}",
             "",
-            f"**Scenario:** {scenario.get('title', 'Unknown')}",
-            f"{scenario.get('description', '')}",
+            f"**Task:** `{self._task.id}`",
+            f"**Benchmark:** `{BENCHMARK_NAME}`",
+            f"**Domain / Role:** `{self._task.domain}` / `{self._task.role}`",
+            f"**Step:** {self._state.step_count + 1}/{self._state.max_steps}",
             "",
-            f"**Available Tools:** {tool_list}",
+            f"**Goal:** {self._task.goal}",
             "",
-            f"**Cumulative Reward:** {s.cumulative_reward:.4f}",
+            f"**Question:** {self._task.question}",
+            "",
+            self._task.context,
+            "",
+            f"**Available Tools:** {tools}",
+            "",
+            f"**Cumulative Reward:** {self._state.cumulative_reward:.4f}",
         ]
         if extra:
-            lines += ["", "---", extra]
-        if s.action_history:
-            last = s.action_history[-1]
-            lines += [
-                "",
-                f"**Last Action:** `{last.get('tool')}` → reward `{last.get('reward', 0):.4f}`",
-            ]
+            lines.extend(["", "---", extra])
         return "\n".join(lines)
 
-    # ── OpenEnv API ───────────────────────────
-
-    def reset(self, **kwargs) -> HackathonObservation:
-        domain = kwargs.get("domain", self._state.domain)
-        role = kwargs.get("role", self._state.role)
-        openrouter_key = kwargs.get("openrouter_key", self._state.openrouter_key)
-        judge_model = kwargs.get("judge_model", self._state.judge_model)
-        use_llm_judge = kwargs.get("use_llm_judge", self._state.use_llm_judge)
-
-        scenario = self._get_scenario()
-        self._state = HackathonState(
-            domain=domain,
-            role=role,
-            max_steps=self._state.max_steps,
-            scenario=scenario,
-            openrouter_key=openrouter_key,
-            judge_model=judge_model,
-            use_llm_judge=use_llm_judge,
-        )
-        tools = self._get_tools()
-        obs_text = self._build_observation_text("Environment reset. Make your first move.")
-
+    def _make_observation(self, *, reward: float, reward_breakdown: Dict[str, Any], done: bool) -> HackathonObservation:
         return HackathonObservation(
-            text=obs_text,
-            step=0,
-            max_steps=self._state.max_steps,
-            available_tools=list(tools.keys()),
-            scenario_context=self._state.scenario,
-            done=False,
+            text=self._build_text(
+                extra=(
+                    "Use one high-leverage action grounded in the scenario."
+                    if self._state.step_count == 0 and not reward_breakdown
+                    else f"Reward `{reward:.4f}` computed via `{reward_breakdown.get('method', 'deterministic_task_grader')}`."
+                )
+            ),
+            task_id=self._task.id,
+            task_name=self._task.name,
+            domain=self._task.domain,
+            role=self._task.role,
+            question=self._task.question,
+            context=self._task.context,
+            step=self._state.step_count,
+            max_steps=self._task.max_steps,
+            available_tools=list(self._state.available_tools),
+            scenario_context=dict(self._state.scenario_context),
+            reward_breakdown=reward_breakdown,
+            counterfactual_tip=self._task.counterfactual_tip,
+            reward=reward,
+            done=done,
+            metadata={
+                "task_id": self._task.id,
+                "scenario_id": self._task.scenario_id,
+            },
         )
 
-    def step(self, action: HackathonAction) -> HackathonObservation:
+    def reset(
+        self,
+        seed: Optional[int] = None,
+        episode_id: Optional[str] = None,
+        **kwargs: Any,
+    ) -> HackathonObservation:
+        self._task = get_task(
+            kwargs.get("task_id"),
+            domain=kwargs.get("domain"),
+            role=kwargs.get("role"),
+            seed=seed,
+        )
+
+        self._state = HackathonState(
+            episode_id=episode_id or str(uuid4()),
+            step_count=0,
+            task_id=self._task.id,
+            task_name=self._task.name,
+            domain=self._task.domain,
+            role=self._task.role,
+            scenario_id=self._task.scenario_id,
+            scenario_title=self._task.scenario_title,
+            max_steps=self._task.max_steps,
+            cumulative_reward=0.0,
+            last_reward=0.0,
+            done=False,
+            action_history=[],
+            available_tools=list(self._tools().keys()),
+            scenario_context=self._scenario_context(self._task),
+            api_base_url=kwargs.get("api_base_url", self._state.api_base_url or os.environ.get("API_BASE_URL")),
+            api_key=kwargs.get("api_key", kwargs.get("hf_token", self._state.api_key or os.environ.get("HF_TOKEN"))),
+            judge_model=kwargs.get("judge_model", kwargs.get("model_name", self._state.judge_model or os.environ.get("MODEL_NAME"))),
+            use_llm_judge=bool(kwargs.get("use_llm_judge", self._state.use_llm_judge)),
+        )
+
+        return self._make_observation(reward=0.0, reward_breakdown={}, done=False)
+
+    def step(
+        self,
+        action: HackathonAction,
+        timeout_s: Optional[float] = None,
+        **kwargs: Any,
+    ) -> HackathonObservation:
         if self._state.done:
-            return HackathonObservation(
-                text="Episode is done. Call reset() to start a new episode.",
-                step=self._state.step,
-                max_steps=self._state.max_steps,
+            return self._make_observation(
+                reward=self._state.last_reward,
+                reward_breakdown={"method": "episode_complete", "message": "Call reset() to start another task."},
                 done=True,
             )
 
-        tools = self._get_tools()
-        agent_output = json.dumps({
-            "tool": action.tool,
-            "args": action.args,
-            "reasoning": action.reasoning,
-        }, indent=2)
-
-        if compute_reward:
-            reward, detail = compute_reward(
-                agent_output=agent_output,
-                tool_name=action.tool,
-                args=action.args,
-                available_tools=list(tools.keys()),
-                tool_registry=tools,
-                scenario=self._state.scenario,
-                step_context={
-                    "step": self._state.step,
-                    "domain": self._state.domain,
-                    "role": self._state.role,
-                },
-                previous_actions=self._state.action_history[-5:],
-                openrouter_key=self._state.openrouter_key,
-                judge_model=self._state.judge_model,
-                use_llm_judge=self._state.use_llm_judge,
-            )
-        else:
-            reward = 0.5
-            detail = {"method": "fallback"}
-
-        self._state.action_history.append({
-            "step": self._state.step,
-            "tool": action.tool,
-            "args": action.args,
-            "reasoning": action.reasoning,
-            "reward": reward,
-            "detail": detail,
-        })
-        self._state.cumulative_reward += reward
-        self._state.step += 1
-        self._state.done = self._state.step >= self._state.max_steps
-
-        obs_text = self._build_observation_text(
-            f"Action `{action.tool}` → Reward: **{reward:.4f}**\n\n"
-            f"Method: `{detail.get('method', '?')}`"
+        tools = self._tools()
+        reward, detail = compute_reward(
+            agent_output=json.dumps(
+                {
+                    "tool": action.tool,
+                    "args": action.args,
+                    "reasoning": action.reasoning,
+                }
+            ),
+            tool_name=action.tool,
+            args=action.args,
+            reasoning=action.reasoning,
+            available_tools=list(tools.keys()),
+            tool_registry=tools,
+            scenario=self._state.scenario_context,
+            step_context={
+                "step": self._state.step_count + 1,
+                "domain": self._task.domain,
+                "role": self._task.role,
+                "task_id": self._task.id,
+            },
+            previous_actions=self._state.action_history[-3:],
+            task=self._task,
+            api_key=kwargs.get("api_key", self._state.api_key),
+            api_base_url=kwargs.get("api_base_url", self._state.api_base_url),
+            judge_model=kwargs.get("judge_model", self._state.judge_model),
+            use_llm_judge=bool(kwargs.get("use_llm_judge", self._state.use_llm_judge)),
         )
 
-        return HackathonObservation(
-            text=obs_text,
-            step=self._state.step,
-            max_steps=self._state.max_steps,
-            available_tools=list(tools.keys()),
-            scenario_context=self._state.scenario,
+        self._state.step_count += 1
+        self._state.last_reward = reward
+        self._state.cumulative_reward += reward
+        self._state.action_history.append(
+            {
+                "step": self._state.step_count,
+                "tool": action.tool,
+                "args": dict(action.args),
+                "reasoning": action.reasoning,
+                "reward": reward,
+                "detail": detail,
+            }
+        )
+
+        self._state.done = self._state.step_count >= self._task.max_steps or reward >= self._task.success_threshold
+        if self._state.done:
+            detail["episode_grade"] = grade_episode(
+                self._task,
+                [item["reward"] for item in self._state.action_history],
+                self._state.done,
+            )
+
+        return self._make_observation(
+            reward=reward,
             reward_breakdown=detail,
             done=self._state.done,
         )
 
+    @property
     def state(self) -> HackathonState:
         return self._state
 
-    def invoke_subagent(
-        self,
-        specialist: str,
-        question: str,
-        api_key: Optional[str] = None,
-        model: str = "anthropic/claude-3.5-sonnet",
-    ) -> str:
-        """
-        Consult a specialist sub-agent via OpenRouter.
-        Returns the specialist's advice as a string.
-        """
-        import requests as _req
-
-        key = api_key or self._state.openrouter_key
-        if not key:
-            return "No API key configured for sub-agent."
-
-        sys_prompt = (
-            f"You are a {specialist} with deep expertise. "
-            f"Scenario domain: {self._state.domain}. "
-            f"Current step: {self._state.step}/{self._state.max_steps}. "
-            f"Scenario: {json.dumps(self._state.scenario)}. "
-            "Provide concise, actionable advice in 3-5 sentences."
+    def get_metadata(self) -> EnvironmentMetadata:
+        return EnvironmentMetadata(
+            name="Hackathon OpenEnv",
+            description=(
+                "OpenEnv benchmark for strategic business decision making with deterministic task graders, "
+                "typed action/observation/state models, and Hugging Face Space deployment support."
+            ),
+            version="1.0.0",
+            author="Hardik Arora",
+            documentation_url="https://huggingface.co/docs/hub/en/spaces-overview",
+            readme_content=(
+                f"{BENCHMARK_NAME} exposes {len(list_tasks())} graded tasks with role-specific tools, "
+                "deterministic rewards, optional LLM judging, and a root-level baseline inference script."
+            ),
         )
-        try:
-            resp = _req.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                json={
-                    "model": model,
-                    "messages": [
-                        {"role": "system", "content": sys_prompt},
-                        {"role": "user", "content": question},
-                    ],
-                    "max_tokens": 400,
-                    "temperature": 0.5,
-                },
-                timeout=30,
-            )
-            resp.raise_for_status()
-            return resp.json()["choices"][0]["message"]["content"]
-        except Exception as e:
-            return f"Sub-agent error: {e}"

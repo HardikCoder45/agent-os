@@ -51,3 +51,7 @@ htmlcov/
 
 # Gradio
 flagged/
+
+# Generated artifacts
+outputs/
+inference_results.json

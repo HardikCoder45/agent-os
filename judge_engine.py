@@ -18,15 +18,12 @@ All LLM calls go through OpenRouter.  Structured output via Pydantic + LangChain
 from __future__ import annotations
 
 import json
+import os
 import re
-import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
-import requests
 from pydantic import BaseModel, Field
-from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage
-from langgraph.graph import StateGraph, END
+from openai import OpenAI
 
 
 # ─────────────────────────────────────────────
@@ -105,6 +102,7 @@ class JudgeState(BaseModel):
     step_context: Dict[str, Any] = Field(default_factory=dict)
     available_tools: List[str] = Field(default_factory=list)
     previous_actions: List[Dict] = Field(default_factory=list)
+    api_base_url: str = ""
     api_key: str = ""
     model: str = "anthropic/claude-3.5-sonnet"
 
@@ -142,33 +140,29 @@ ABSOLUTE PRINCIPLES:
 OUTPUT: Always respond ONLY with valid JSON matching the schema you are given. No extra text."""
 
 
-def _llm_call(api_key: str, model: str, user_prompt: str, schema_example: str) -> str:
-    """Call OpenRouter and return raw JSON string."""
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://hackathon-env.local",
-        "X-Title": "Hackathon Environment Judge",
-    }
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": JUDGE_SYSTEM},
-            {"role": "user", "content": f"{user_prompt}\n\nRespond ONLY with JSON matching this schema example:\n{schema_example}"},
-        ],
-        "temperature": 0.1,
-        "max_tokens": 1200,
-        "response_format": {"type": "json_object"},
-    }
+def _llm_call(api_base_url: str, api_key: str, model: str, user_prompt: str, schema_example: str) -> str:
+    """Call an OpenAI-compatible chat endpoint and return raw JSON text."""
     try:
-        resp = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=45,
+        client = OpenAI(
+            base_url=api_base_url or os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1"),
+            api_key=api_key,
         )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
+        response = client.chat.completions.create(
+            model=model,
+            temperature=0.1,
+            max_tokens=1200,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": JUDGE_SYSTEM},
+                {
+                    "role": "user",
+                    "content": (
+                        f"{user_prompt}\n\nRespond ONLY with JSON matching this schema example:\n{schema_example}"
+                    ),
+                },
+            ],
+        )
+        return response.choices[0].message.content or "{}"
     except Exception as e:
         return json.dumps({"error": str(e)})
 
@@ -305,7 +299,7 @@ SCORING CRITERIA (be strict):
 - reasoning: Explain every deduction in 2-4 sentences.
 """
     schema_ex = '{"score": 0.85, "tool_exists": true, "args_complete": true, "args_types_correct": true, "hallucinated_args": [], "reasoning": "..."}'
-    raw = _llm_call(state.api_key, state.model, prompt, schema_ex)
+    raw = _llm_call(state.api_base_url, state.api_key, state.model, prompt, schema_ex)
     parsed = _parse_json_safe(raw, ToolValidityScore)
     state.tool_validity = parsed or ToolValidityScore(
         score=0.3, tool_exists=False, args_complete=False,
@@ -357,7 +351,7 @@ HARD RULES:
 - If reasoning shows no understanding of business context → max 0.5
 """
     schema_ex = '{"score": 0.72, "has_reasoning": true, "reasoning_coherent": true, "reasoning_relevant": true, "logical_steps_count": 3, "contradictions": [], "reasoning": "..."}'
-    raw = _llm_call(state.api_key, state.model, prompt, schema_ex)
+    raw = _llm_call(state.api_base_url, state.api_key, state.model, prompt, schema_ex)
     parsed = _parse_json_safe(raw, ReasoningScore)
     state.reasoning_score = parsed or ReasoningScore(
         score=0.2, has_reasoning=False, reasoning_coherent=False,
@@ -407,7 +401,7 @@ HARD RULES:
 - If agent reverses previous progress → max 0.3
 """
     schema_ex = '{"score": 0.8, "advances_goal": true, "correct_step_for_phase": true, "missed_opportunities": ["Could have used X for better result"], "reasoning": "..."}'
-    raw = _llm_call(state.api_key, state.model, prompt, schema_ex)
+    raw = _llm_call(state.api_base_url, state.api_key, state.model, prompt, schema_ex)
     parsed = _parse_json_safe(raw, TaskAlignmentScore)
     state.task_alignment = parsed or TaskAlignmentScore(
         score=0.3, advances_goal=False, correct_step_for_phase=False, reasoning=f"Parse error: {raw[:200]}"
@@ -448,7 +442,7 @@ HARD RULES:
 - Agent ignores domain-specific constraints entirely → max 0.4
 """
     schema_ex = '{"score": 0.75, "understands_scenario": true, "icp_awareness": false, "business_impact_considered": true, "reasoning": "..."}'
-    raw = _llm_call(state.api_key, state.model, prompt, schema_ex)
+    raw = _llm_call(state.api_base_url, state.api_key, state.model, prompt, schema_ex)
     parsed = _parse_json_safe(raw, StrategicScore)
     state.strategic = parsed or StrategicScore(
         score=0.3, understands_scenario=False, icp_awareness=False,
@@ -490,7 +484,7 @@ HARD RULES:
 - Exposing sensitive data → instant 0.0
 """
     schema_ex = '{"score": 0.9, "catastrophic_move": false, "irreversible_action": false, "risks_identified": [], "reasoning": "..."}'
-    raw = _llm_call(state.api_key, state.model, prompt, schema_ex)
+    raw = _llm_call(state.api_base_url, state.api_key, state.model, prompt, schema_ex)
     parsed = _parse_json_safe(raw, RiskScore)
     state.risk = parsed or RiskScore(
         score=0.5, catastrophic_move=False, irreversible_action=False,
@@ -592,35 +586,6 @@ def node_aggregate(state: JudgeState) -> JudgeState:
 
 
 # ─────────────────────────────────────────────
-#  Build LangGraph
-# ─────────────────────────────────────────────
-
-def _build_graph():
-    g = StateGraph(JudgeState)
-    g.add_node("parse_action", node_parse_action)
-    g.add_node("hard_rule_check", node_hard_rule_check)
-    g.add_node("tool_validity", node_tool_validity)
-    g.add_node("reasoning_judge", node_reasoning_judge)
-    g.add_node("task_alignment", node_task_alignment)
-    g.add_node("strategic_judge", node_strategic_judge)
-    g.add_node("risk_judge", node_risk_judge)
-    g.add_node("aggregate", node_aggregate)
-
-    g.set_entry_point("parse_action")
-    g.add_edge("parse_action", "hard_rule_check")
-    g.add_edge("hard_rule_check", "tool_validity")
-    g.add_edge("tool_validity", "reasoning_judge")
-    g.add_edge("reasoning_judge", "task_alignment")
-    g.add_edge("task_alignment", "strategic_judge")
-    g.add_edge("strategic_judge", "risk_judge")
-    g.add_edge("risk_judge", "aggregate")
-    g.add_edge("aggregate", END)
-    return g.compile()
-
-JUDGE_GRAPH = _build_graph()
-
-
-# ─────────────────────────────────────────────
 #  Public API
 # ─────────────────────────────────────────────
 
@@ -632,6 +597,7 @@ def run_llm_judge(
     available_tools: List[str],
     previous_actions: List[Dict],
     api_key: str,
+    api_base_url: Optional[str] = None,
     model: str = "anthropic/claude-3.5-sonnet",
 ) -> FinalVerdict:
     """
@@ -645,11 +611,21 @@ def run_llm_judge(
         step_context=step_context,
         available_tools=available_tools,
         previous_actions=previous_actions,
+        api_base_url=api_base_url or os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1"),
         api_key=api_key,
         model=model,
     )
-    result = JUDGE_GRAPH.invoke(state)
-    return result["verdict"]
+    state = node_parse_action(state)
+    state = node_hard_rule_check(state)
+    state = node_tool_validity(state)
+    state = node_reasoning_judge(state)
+    state = node_task_alignment(state)
+    state = node_strategic_judge(state)
+    state = node_risk_judge(state)
+    state = node_aggregate(state)
+    if state.verdict is None:
+        raise RuntimeError("Judge verdict was not produced.")
+    return state.verdict
 
 
 def run_manual_judge(score: float, feedback: str) -> FinalVerdict:

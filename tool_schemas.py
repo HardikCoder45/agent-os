@@ -72,6 +72,15 @@ def _reg(t: ToolSchema) -> ToolSchema:
     return t
 
 
+def get_tools_for_role(role: str, domain: str = "all") -> dict[str, ToolSchema]:
+    return {
+        name: schema
+        for name, schema in TOOL_REGISTRY.items()
+        if (schema.domain in {"all", domain})
+        and ("all" in schema.agent_roles or role in schema.agent_roles)
+    }
+
+
 _reg(ToolSchema("approve_budget", "Approve or deny a budget request with justification",
     agent_roles=["CEO", "CFO"],
     args=[
