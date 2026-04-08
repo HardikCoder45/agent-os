@@ -1,8 +1,0 @@
-Demo File
-
-This is a simple demo file created using Desktop Commander.
-
-Contents:
-- Hello World
-- Sample text
-- End of file
