@@ -1,9 +1,3 @@
-# Core - exact compatible versions
-gradio==4.44.0
-huggingface-hub==0.24.7
-pydantic
-requests
-
 # LangChain / LangGraph
 langchain
 langchain-openai
@@ -14,6 +8,8 @@ langgraph
 openenv-core
 
 # Other deps
+pydantic
+requests
 orjson
 matplotlib
 numpy<2.0.0
