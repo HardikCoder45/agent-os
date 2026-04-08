@@ -1,5 +1,5 @@
-# Core
-gradio==4.36.1
+# Core - using latest stable Gradio
+gradio
 pydantic
 requests
 
