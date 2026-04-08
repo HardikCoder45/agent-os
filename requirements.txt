@@ -1,21 +1,18 @@
-# Core - pinned for Python 3.11 compatibility
-gradio 
-pydantic 
-requests 
+# Core
+gradio==4.36.1
+pydantic
+requests
 
-# LangChain / LangGraph for structured outputs
-langchain 
-langchain-openai 
-langchain-community 
-langgraph 
+# LangChain / LangGraph
+langchain
+langchain-openai
+langchain-community
+langgraph
 
-# OpenEnv (hackathon framework)
-openenv-core 
+# OpenEnv
+openenv-core
 
-# Optional: faster JSON
-orjson 
-
-# Existing deps
-matplotlib 
-numpy 
-pyaudioop
+# Other deps
+orjson
+matplotlib
+numpy<2.0.0
