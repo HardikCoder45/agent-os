@@ -1,4 +1,4 @@
-# Core
+# Core - pinned for Python 3.11 compatibility
 gradio 
 pydantic 
 requests 
@@ -10,11 +10,12 @@ langchain-community
 langgraph 
 
 # OpenEnv (hackathon framework)
-openenv-core
+openenv-core 
 
 # Optional: faster JSON
 orjson 
 
 # Existing deps
-matplotlib
+matplotlib 
 numpy 
+pyaudioop

@@ -32,7 +32,7 @@ env/
 *.swp
 *.swo
 *~
-
+.git-credentials
 # OS
 .DS_Store
 Thumbs.db

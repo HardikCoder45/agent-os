@@ -4,10 +4,11 @@ emoji: 🤖
 colorFrom: blue
 colorTo: purple
 sdk: gradio
-sdk_version: 5.0.0
+sdk_version: 4.36.1
 app_file: app.py
 pinned: false
 license: bsd-3-clause
+python_version: 3.11
 ---
 
 # 🤖 Agent Environment - Multi-Agent Hackathon
