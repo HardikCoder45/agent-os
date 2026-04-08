@@ -6,7 +6,7 @@ step question, J1 scoring panels, replay log, sub-agent console)
 while adding:
   ✅ OpenRouter API key + custom/typed model in UI
   ✅ LLM judge (multi-dimensional) OR manual judge — toggle
-  ✅ MCP server management panel
+  ✅ Configurable score threshold gate
   ✅ NO "Required tool: X" hints anywhere
   ✅ NO hardcoded sub-agent hints
   ✅ All tools shown freely — agent/user picks
@@ -14,6 +14,7 @@ while adding:
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import traceback
@@ -28,7 +29,7 @@ try:
     from agents import AGENTS
     from tool_schemas import TOOL_REGISTRY
     from judge_engine import run_llm_judge, run_manual_judge, FinalVerdict
-    from mcp_client import get_mcp_client
+    from reward_engine import blend_scores
 
     _LOADED = True
 except ImportError as _e:
@@ -114,28 +115,14 @@ except ImportError as _e:
         v.overall_feedback = f
         return v
 
-    def get_mcp_client():
-        class Stub:
-            def add_server(self, *a, **kw):
-                pass
-
-            def connect_server(self, n):
-                return False, "Preview mode"
-
-            def status_summary(self):
-                return "Preview mode — no MCP"
-
-            def get_all_tools(self):
-                return []
-
-            def call_tool(self, *a, **kw):
-                return {"result": "Preview"}
-
-            def remove_server(self, n):
-                pass
-
-        return Stub()
-
+    def blend_scores(manual_score, llm_score):
+        return manual_score, {
+            "manual_weight": 1.0,
+            "llm_weight": 0.0,
+            "agreement_adjustment": 0.0,
+            "agreement_gap": None,
+            "method": "preview",
+        }
 
 # ─────────────────────────────────────────────
 #  Global session state
@@ -144,6 +131,7 @@ ENV: Optional[MultiAgentEnvironment] = None
 OBS: Dict = {}
 ACTION_HISTORY: List[Dict] = []
 JUDGE_HISTORY: List[Any] = []
+STEP_FAILURE_COUNTS: Dict[str, int] = {}
 
 DOMAIN_LIST = list(AGENTS.keys())
 
@@ -188,11 +176,7 @@ def _roles_for_domain(domain: str) -> List[str]:
 
 
 def _all_tools() -> Dict[str, Any]:
-    tools = dict(TOOL_REGISTRY)
-    mcp = get_mcp_client()
-    for t in mcp.get_all_tools():
-        tools[t.name] = t
-    return tools
+    return dict(TOOL_REGISTRY)
 
 
 def _tools_for_role(role: str) -> Dict[str, Any]:
@@ -227,7 +211,7 @@ def _tool_arg_guide(schema) -> str:
     if input_schema:
         props = input_schema.get("properties", {})
         required = input_schema.get("required", [])
-        lines = [f"#### `{name}` _(MCP)_", desc, "", "**Arguments:**"]
+        lines = [f"#### `{name}`", desc, "", "**Arguments:**"]
         for pname, pmeta in props.items():
             req = "✱" if pname in required else "○"
             ptype = pmeta.get("type", "any")
@@ -250,34 +234,60 @@ def _j1_history_md(history: List[float]) -> str:
         return "_No steps yet._"
     bars = "\n".join(f"Step {i + 1}: {_score_bar(s)}" for i, s in enumerate(history))
     avg = sum(history) / len(history)
-    return f"{bars}\n\n**Average J1:** `{avg:.3f}`"
+    return f"{bars}\n\n**Average Score:** `{avg:.3f}`"
 
 
-def _render_verdict(v) -> str:
-    if v is None:
-        return ""
-    if getattr(v, "instant_zero", False):
-        reasons = "\n".join(f"  ‼ {r}" for r in v.instant_zero_reasons)
-        return f"## 🚫 Disqualified\n{reasons}\n\n_{v.overall_feedback}_"
+def _render_score_card(
+    overall_score: float,
+    *,
+    score_mode: str,
+    rubric_score: Optional[float] = None,
+    llm_score: Optional[float] = None,
+    human_score: Optional[float] = None,
+    feedback: str = "",
+    tips: Optional[List[str]] = None,
+    blend_detail: Optional[Dict[str, Any]] = None,
+    blocked: bool = False,
+    block_message: str = "",
+) -> str:
     lines = [
-        f"## ⚖ Judge Verdict — {_score_bar(v.total_score)}",
+        f"## Overall Score: `{overall_score:.3f}`",
         "",
-        "| Dimension | Score |",
-        "|-----------|-------|",
-        f"| 🔧 Tool Validity | {v.tool_validity:.2f}  {_score_bar(v.tool_validity)} |",
-        f"| 🧠 Reasoning | {v.reasoning_quality:.2f}  {_score_bar(v.reasoning_quality)} |",
-        f"| 🎯 Task Alignment | {v.task_alignment:.2f}  {_score_bar(v.task_alignment)} |",
-        f"| 📊 Strategic Quality | {v.strategic_quality:.2f}  {_score_bar(v.strategic_quality)} |",
-        f"| ⚠ Risk / Safety | {v.risk_safety:.2f}  {_score_bar(v.risk_safety)} |",
-        f"| ✨ Hard Rule Bonus | +{v.hard_rule_bonus:.2f} |",
+        _score_bar(overall_score),
         "",
-        f"**Feedback:** {v.overall_feedback}",
+        f"**Mode:** {score_mode}",
     ]
-    if v.improvement_tips:
-        lines.append("**Tips:**")
-        for tip in v.improvement_tips:
-            lines.append(f"  → {tip}")
-    lines.append(f"\n_Judge confidence: {v.judge_confidence:.0%}_")
+
+    component_parts = []
+    if rubric_score is not None:
+        component_parts.append(f"Rubric `{rubric_score:.3f}`")
+    if llm_score is not None:
+        component_parts.append(f"LLM `{llm_score:.3f}`")
+    if human_score is not None:
+        component_parts.append(f"Human `{human_score:.3f}`")
+    if component_parts:
+        lines.append(f"**Components:** {' | '.join(component_parts)}")
+
+    if blend_detail and blend_detail.get("llm_weight", 0.0) > 0:
+        lines.append(
+            f"**Blend:** rubric {blend_detail.get('manual_weight', 0.0):.0%} + "
+            f"LLM {blend_detail.get('llm_weight', 0.0):.0%}"
+        )
+        agreement_gap = blend_detail.get("agreement_gap")
+        if agreement_gap is not None:
+            lines.append(f"**Agreement Gap:** `{agreement_gap:.3f}`")
+
+    if blocked and block_message:
+        lines.extend(["", f"**Threshold Result:** {block_message}"])
+
+    if feedback:
+        lines.extend(["", f"**Feedback:** {feedback}"])
+
+    if tips:
+        lines.extend(["", "**Improvement Tips:**"])
+        for tip in tips[:4]:
+            lines.append(f"  -> {tip}")
+
     return "\n".join(lines)
 
 
@@ -285,8 +295,8 @@ def _replay_md(replay: List[Dict]) -> str:
     if not replay:
         return "_No actions yet._"
     lines = [
-        "| Step | Tool | J1 | Words | Rubric |",
-        "|------|------|----|-------|--------|",
+        "| Step | Tool | Rubric Score | Words | Tier |",
+        "|------|------|--------------|-------|------|",
     ]
     for r in replay:
         j1 = f"{r.get('j1', 0):.3f}"
@@ -305,6 +315,62 @@ def _progress_bar(step: int, total: int) -> str:
     return f"**Progress:**  Step {step}/{total}  `{bar}`  {int(pct * 100)}%"
 
 
+def _step_panel(obs: Dict[str, Any], extra_note: str = "") -> str:
+    step_idx = int(obs.get("step_index", 0))
+    total = int(obs.get("total_steps", 0))
+    panel = (
+        f"### Step {step_idx + 1} / {total}\n\n"
+        f"**{obs.get('step_question', '')}**\n\n"
+        f"_{obs.get('step_context', '')}_"
+    )
+    if extra_note:
+        panel += f"\n\n{extra_note}"
+    return panel
+
+
+def _hint_block(obs: Dict[str, Any], counterfactual: str, fail_count: int) -> str:
+    hints: List[str] = []
+    arg_hints = obs.get("required_args_hints", {}) or {}
+    for _, hint_text in list(arg_hints.items())[:3]:
+        hints.append(f"- {hint_text}")
+    if counterfactual:
+        hints.append(f"- Counterfactual: {counterfactual}")
+    if not hints:
+        hints.append("- Make the reasoning more explicit, scenario-specific, and measurable.")
+    return (
+        f"**Hint Mode Activated:** {fail_count} failed attempts on this step.\n\n"
+        "Use these hints before retrying:\n"
+        + "\n".join(hints)
+    )
+
+
+def _manual_feedback(manual_score: float, manual_breakdown: Dict[str, Any], tool_errors: List[str]) -> Tuple[str, List[str]]:
+    reasoning_score = float(manual_breakdown.get("reasoning_score", manual_score))
+    tool_arg_score = float(manual_breakdown.get("tool_arg_score", manual_score))
+    rubric_tier = manual_breakdown.get("rubric_tier", "unknown")
+    tool_hints = list(manual_breakdown.get("tool_hints", []) or [])
+
+    if manual_score >= 0.85:
+        feedback = "Rubric scoring sees a strong step: the tool choice and reasoning are aligned with the scenario."
+    elif manual_score >= 0.65:
+        feedback = "Rubric scoring sees a workable answer, but it still needs sharper scenario alignment or fuller arguments."
+    elif manual_score >= 0.40:
+        feedback = "Rubric scoring sees partial progress only. The action is missing important step-specific detail."
+    else:
+        feedback = "Rubric scoring sees a weak move for this step. The answer is not grounded enough in the scenario requirements."
+
+    tips: List[str] = []
+    if tool_errors:
+        tips.extend(tool_errors[:2])
+    if tool_arg_score < 0.65:
+        tips.extend(tool_hints[:2] or ["Tighten the tool arguments and cover the core required fields."])
+    if reasoning_score < 0.65:
+        tips.append("Make the reasoning more explicit about tradeoffs, risks, and success criteria.")
+    if rubric_tier == "poor":
+        tips.append("Re-anchor the answer to the exact question being asked on this step.")
+    return feedback, tips[:4]
+
+
 # ─────────────────────────────────────────────
 #  Event handlers
 # ─────────────────────────────────────────────
@@ -316,12 +382,13 @@ def on_domain_change(domain: str):
 
 
 def on_start(domain: str, role: str):
-    global ENV, OBS, ACTION_HISTORY, JUDGE_HISTORY
+    global ENV, OBS, ACTION_HISTORY, JUDGE_HISTORY, STEP_FAILURE_COUNTS
     try:
         ENV = MultiAgentEnvironment(domain=domain)
         OBS = ENV.reset(agent_role=role)
         ACTION_HISTORY = []
         JUDGE_HISTORY = []
+        STEP_FAILURE_COUNTS = {}
 
         role_tools = _tools_for_role(role)
         tool_names = list(role_tools.keys())
@@ -398,12 +465,13 @@ def on_step(
     args_text: str,
     reasoning: str,
     judge_mode: str,
-    manual_score: float,
+    manual_score_input: float,
     manual_feedback: str,
+    pass_threshold: float,
     api_key: str,
     judge_model: str,
 ):
-    global OBS, ACTION_HISTORY, JUDGE_HISTORY
+    global ENV, OBS, ACTION_HISTORY, JUDGE_HISTORY, STEP_FAILURE_COUNTS
     if ENV is None:
         return ("⚠ Start a scenario first.", "", "", "", "")
 
@@ -416,6 +484,12 @@ def on_step(
             if "=" in part:
                 k, v = part.split("=", 1)
                 args[k.strip()] = v.strip().strip("\"'")
+
+    env_snapshot = copy.deepcopy(ENV)
+    obs_snapshot = copy.deepcopy(OBS)
+    action_history_snapshot = copy.deepcopy(ACTION_HISTORY)
+    judge_history_snapshot = copy.deepcopy(JUDGE_HISTORY)
+    step_id = str(obs_snapshot.get("step_id", f"step_{obs_snapshot.get('step_index', 0)}"))
 
     # Step env
     try:
@@ -440,15 +514,14 @@ def on_step(
     tool_errors = result.get("tool_errors", [])
     counterfactual = result.get("counterfactual", "")
 
-    step_idx = OBS.get("step_index", 0) + 1
-    total = OBS.get("total_steps", 8)
-    OBS["step_index"] = step_idx
+    step_idx = int(obs_snapshot.get("step_index", 0)) + 1
+    total = int(obs_snapshot.get("total_steps", 8))
 
     if done:
         j1_avg = sum(r.get("j1", 0) for r in replay) / max(len(replay), 1)
         step_md = (
             f"## ✅ Scenario Complete!\n\n"
-            f"**Average J1:** {j1_avg:.3f}  |  **J2:** {result.get('j2', 0):.3f}\n\n"
+            f"**Average Rubric Score:** {j1_avg:.3f}  |  **J2:** {result.get('j2', 0):.3f}\n\n"
             f"_Review the Replay Log below._"
         )
     elif next_step:
@@ -475,97 +548,202 @@ def on_step(
 
     # Judge
     verdict = None
+    llm_verdict = None
+    llm_score: Optional[float] = None
+    human_score: Optional[float] = None
+    blend_detail: Optional[Dict[str, Any]] = None
+    rubric_score = float(result.get("manual_score", env_j1))
+    manual_breakdown = result.get("manual_breakdown", {})
+    rubric_feedback, rubric_tips = _manual_feedback(rubric_score, manual_breakdown, tool_errors)
     action_str = json.dumps(
         {"tool": tool_name, "args": args, "reasoning": reasoning}, indent=2
     )
-
-    if judge_mode == "🤖 LLM Judge":
-        if not api_key.strip():
-            verdict_md = "⚠ Enter your API key in the Config panel to use LLM judging."
-        else:
-            try:
-                role_tools = _tools_for_role(role)
-                # Convert ArgSpec objects to dicts to avoid JSON serialization errors
-                tool_registry_serializable = {}
-                for k, v in role_tools.items():
-                    args_list = getattr(v, "args", [])
-                    # Convert ArgSpec objects to dicts
-                    serializable_args = []
-                    for arg in args_list:
-                        if hasattr(arg, '__dict__'):
-                            serializable_args.append({
-                                "name": getattr(arg, "name", ""),
-                                "type": getattr(arg, "type", ""),
-                                "required": getattr(arg, "required", True),
-                                "options": getattr(arg, "options", None),
-                                "hint": getattr(arg, "hint", ""),
-                            })
-                        else:
-                            serializable_args.append(arg)
-                    
-                    tool_registry_serializable[k] = {
-                        "description": getattr(v, "description", ""),
-                        "args": serializable_args,
-                    }
-                
-                verdict = run_llm_judge(
-                    agent_output=action_str,
-                    tool_registry=tool_registry_serializable,
-                    scenario={
-                        "title": OBS.get("scenario_title", ""),
-                        "goal": OBS.get("scenario_goal", ""),
-                        "briefing": OBS.get("scenario_briefing", ""),
-                        "domain": getattr(ENV, "domain", ""),
-                        "role": role,
-                    },
-                    step_context={
-                        "step": step_idx,
-                        "total_steps": total,
-                        "step_id": OBS.get("step_id", ""),
-                        "question": OBS.get("step_question", ""),
-                        "context": OBS.get("step_context", ""),
-                        "env_j1": env_j1,
-                    },
-                    available_tools=list(role_tools.keys()),
-                    previous_actions=ACTION_HISTORY[-5:],
-                    api_base_url=DEFAULT_API_BASE_URL,
-                    api_key=api_key.strip(),
-                    model=judge_model,
-                )
-                verdict_md = _render_verdict(verdict)
-            except Exception as e:
-                verdict_md = f"❌ LLM Judge error: {e}\n\n```\n{traceback.format_exc()}\n```"
-    elif judge_mode == "✍ Manual Judge":
-        verdict = run_manual_judge(manual_score / 100.0, manual_feedback)
-        verdict_md = _render_verdict(verdict)
-    else:
-        verdict = run_manual_judge(min(1.0, env_j1), f"Env J1: {env_j1:.3f}")
-        verdict_md = _render_verdict(verdict) + "\n\n_Hybrid: env J1 used as score_"
-
-    ACTION_HISTORY.append(
-        {
-            "step": step_idx,
-            "tool": tool_name,
-            "args": args,
-            "reasoning": reasoning,
-            "env_j1": env_j1,
-            "judge_score": getattr(verdict, "total_score", None),
+    role_tools = _tools_for_role(role)
+    tool_registry_serializable = {}
+    for k, v in role_tools.items():
+        args_list = getattr(v, "args", [])
+        serializable_args = []
+        for arg in args_list:
+            if hasattr(arg, "__dict__"):
+                serializable_args.append({
+                    "name": getattr(arg, "name", ""),
+                    "type": getattr(arg, "type", ""),
+                    "required": getattr(arg, "required", True),
+                    "options": getattr(arg, "options", None),
+                    "hint": getattr(arg, "hint", ""),
+                })
+            else:
+                serializable_args.append(arg)
+        tool_registry_serializable[k] = {
+            "description": getattr(v, "description", ""),
+            "args": serializable_args,
         }
-    )
-    if verdict:
-        JUDGE_HISTORY.append(verdict)
 
-    j1_history = [r.get("j1", 0) for r in replay]
+    llm_requested = judge_mode in {"🤖 LLM Judge", "⚖ Hybrid", "🧩 Combined Judge"}
+    if llm_requested and api_key.strip():
+        try:
+            llm_verdict = run_llm_judge(
+                agent_output=action_str,
+                tool_registry=tool_registry_serializable,
+                scenario={
+                    "title": obs_snapshot.get("scenario_title", ""),
+                    "goal": obs_snapshot.get("scenario_goal", ""),
+                    "briefing": obs_snapshot.get("scenario_briefing", ""),
+                    "domain": getattr(ENV, "domain", ""),
+                    "role": role,
+                },
+                step_context={
+                    "step": step_idx,
+                    "total_steps": total,
+                    "step_id": obs_snapshot.get("step_id", ""),
+                    "question": obs_snapshot.get("step_question", ""),
+                    "context": obs_snapshot.get("step_context", ""),
+                    "rubric_score": rubric_score,
+                },
+                available_tools=list(role_tools.keys()),
+                previous_actions=ACTION_HISTORY[-5:],
+                api_base_url=DEFAULT_API_BASE_URL,
+                api_key=api_key.strip(),
+                model=judge_model,
+            )
+            if llm_verdict and not llm_verdict.instant_zero:
+                llm_score = llm_verdict.total_score
+        except Exception:
+            llm_verdict = None
+
+    feedback = rubric_feedback
+    tips = list(rubric_tips)
+    mode_label = "Rubric Judge"
+
+    if judge_mode == "✍ Human Override" or judge_mode == "✍ Manual Judge":
+        human_score = max(0.0, min(1.0, manual_score_input / 100.0))
+        final_score = human_score
+        feedback = manual_feedback if manual_feedback.strip() else "Human override is active."
+        tips = []
+        mode_label = "Human Override"
+    elif judge_mode == "🧮 Rubric Judge":
+        final_score = rubric_score
+        mode_label = "Rubric Judge"
+    elif judge_mode == "🤖 LLM Judge":
+        if llm_verdict is not None:
+            if llm_verdict.instant_zero:
+                final_score = 0.0
+                llm_score = 0.0
+                feedback = llm_verdict.overall_feedback
+                tips = list(llm_verdict.instant_zero_reasons) + list(llm_verdict.improvement_tips)
+            else:
+                final_score = llm_verdict.total_score
+                llm_score = llm_verdict.total_score
+                feedback = llm_verdict.overall_feedback
+                tips = list(llm_verdict.improvement_tips)
+            mode_label = "LLM Judge"
+        else:
+            final_score = rubric_score
+            feedback = "LLM judge was unavailable, so the rubric score was used as a fallback."
+            mode_label = "LLM Judge (rubric fallback)"
+    else:
+        if llm_verdict is not None and llm_verdict.instant_zero:
+            final_score = 0.0
+            llm_score = 0.0
+            feedback = llm_verdict.overall_feedback
+            tips = list(llm_verdict.instant_zero_reasons) + list(llm_verdict.improvement_tips) + list(rubric_tips)
+            blend_detail = {
+                "manual_weight": 0.55,
+                "llm_weight": 0.45,
+                "agreement_adjustment": 0.0,
+                "agreement_gap": 1.0,
+                "method": "instant_zero",
+            }
+        else:
+            final_score, blend_detail = blend_scores(rubric_score, llm_score)
+            if llm_verdict is not None and llm_score is not None:
+                feedback = llm_verdict.overall_feedback
+                tips = list(dict.fromkeys(list(rubric_tips) + list(llm_verdict.improvement_tips)))
+                mode_label = "Combined Judge"
+            else:
+                feedback = "Combined mode is using the rubric score because the LLM judge is unavailable."
+                mode_label = "Combined Judge (rubric fallback)"
+
+    verdict_md = _render_score_card(
+        final_score,
+        score_mode=mode_label,
+        rubric_score=rubric_score,
+        llm_score=llm_score,
+        human_score=human_score,
+        feedback=feedback,
+        tips=tips,
+        blend_detail=blend_detail,
+    )
+
+    threshold_passed = final_score >= float(pass_threshold)
+
+    attempt_record = {
+        "step": step_idx,
+        "tool": tool_name,
+        "args": args,
+        "reasoning": reasoning,
+        "env_j1": env_j1,
+        "rubric_score": rubric_score,
+        "llm_score": llm_score,
+        "final_score": final_score,
+        "judge_score": llm_score,
+        "judge_mode": mode_label,
+        "passed_threshold": threshold_passed,
+        "threshold": float(pass_threshold),
+    }
+    history_verdict = llm_verdict if llm_verdict is not None else run_manual_judge(final_score, feedback)
+
+    if not threshold_passed:
+        ENV = env_snapshot
+        OBS = obs_snapshot
+        ACTION_HISTORY = action_history_snapshot + [attempt_record]
+        JUDGE_HISTORY = judge_history_snapshot + ([history_verdict] if history_verdict else [])
+        fail_count = STEP_FAILURE_COUNTS.get(step_id, 0) + 1
+        STEP_FAILURE_COUNTS[step_id] = fail_count
+
+        failure_note = (
+            f"**Threshold Gate:** Score `{final_score:.3f}` is below the pass threshold "
+            f"`{pass_threshold:.2f}`. This step did **not** advance. Revise the action and retry."
+        )
+        if tool_errors:
+            failure_note += "\n\n**⚠ Tool Issues:**\n" + "\n".join(f"  • {e}" for e in tool_errors)
+        if counterfactual:
+            failure_note += f"\n\n**💡 Counterfactual:** _{counterfactual}_"
+        if fail_count >= 3:
+            failure_note += f"\n\n{_hint_block(OBS, counterfactual, fail_count)}"
+            if tips:
+                failure_note += "\n\n**Scoring Hints:**\n" + "\n".join(f"- {tip}" for tip in tips[:3])
+
+        verdict_md += (
+            f"\n\n**Threshold Result:** blocked at `{final_score:.3f}` / required `{pass_threshold:.2f}`."
+        )
+        return (
+            _step_panel(OBS, failure_note),
+            verdict_md,
+            _j1_history_md([item.get("final_score", item.get("env_j1", 0.0)) for item in ACTION_HISTORY]),
+            _progress_bar(int(OBS.get("step_index", 0)) + 1, int(OBS.get("total_steps", total))),
+            _replay_md(env_snapshot.replay if hasattr(env_snapshot, "replay") else []),
+        )
+
+    ACTION_HISTORY = action_history_snapshot + [attempt_record]
+    JUDGE_HISTORY = judge_history_snapshot + ([history_verdict] if history_verdict else [])
+    STEP_FAILURE_COUNTS.pop(step_id, None)
+    if hasattr(ENV, "_build_obs"):
+        OBS = ENV._build_obs(event="step")
+    else:
+        OBS["step_index"] = step_idx
+
+    score_history = [item.get("final_score", item.get("env_j1", 0.0)) for item in ACTION_HISTORY]
     progress_md = (
-        _progress_bar(step_idx + 1, total)
+        _progress_bar(int(OBS.get("step_index", 0)) + 1, int(OBS.get("total_steps", total)))
         if not done
         else f"**Complete!** {total}/{total} steps ✅"
     )
 
     return (
-        step_md,
+        _step_panel(OBS) if not done else step_md,
         verdict_md,
-        _j1_history_md(j1_history),
+        _j1_history_md(score_history),
         progress_md,
         _replay_md(replay),
     )
@@ -616,35 +794,8 @@ def on_subagent(
         return f"❌ Sub-agent error: {e}"
 
 
-def on_mcp_connect(server_name: str, server_url: str, role: str):
-    if not server_name.strip() or not server_url.strip():
-        return "⚠ Provide both server name and URL.", gr.update()
-    mcp = get_mcp_client()
-    mcp.add_server(server_name.strip(), server_url.strip(), "sse")
-    ok, msg = mcp.connect_server(server_name.strip())
-    status = f"{'✅' if ok else '❌'} {msg}\n\n{mcp.status_summary()}"
-    return status, gr.update(choices=list(_tools_for_role(role).keys()))
-
-
-def on_mcp_disconnect(server_name: str, role: str):
-    mcp = get_mcp_client()
-    mcp.remove_server(server_name.strip())
-    return mcp.status_summary(), gr.update(choices=list(_tools_for_role(role).keys()))
-
-
-def on_mcp_call(server_name: str, tool_name: str, args_text: str):
-    mcp = get_mcp_client()
-    try:
-        args = json.loads(args_text) if args_text.strip() else {}
-    except Exception:
-        return "❌ Invalid JSON args"
-    return json.dumps(
-        mcp.call_tool(server_name.strip(), tool_name.strip(), args), indent=2
-    )
-
-
 def on_reset(domain: str, role: str):
-    global ENV, OBS, ACTION_HISTORY, JUDGE_HISTORY
+    global ENV, OBS, ACTION_HISTORY, JUDGE_HISTORY, STEP_FAILURE_COUNTS
     if ENV is None:
         return (
             '<div style="background:#f0f0f0;border-radius:10px;padding:20px;'
@@ -665,6 +816,7 @@ def on_reset(domain: str, role: str):
         OBS = ENV.reset(agent_role=role)
         ACTION_HISTORY = []
         JUDGE_HISTORY = []
+        STEP_FAILURE_COUNTS = {}
 
         role_tools = _tools_for_role(role)
         tool_names = list(role_tools.keys())
@@ -753,13 +905,16 @@ def on_get_state():
 def on_history():
     if not ACTION_HISTORY:
         return "_No actions yet._"
-    lines = ["| Step | Tool | Env J1 | Judge Score |", "|------|------|---------|----|"]
+    lines = ["| Step | Tool | Final | Rubric | LLM | Status |", "|------|------|-------|--------|-----|--------|"]
     for a in ACTION_HISTORY:
-        js = f"{a['judge_score']:.3f}" if a.get("judge_score") is not None else "—"
-        lines.append(f"| {a['step']} | `{a['tool']}` | {a['env_j1']:.4f} | {js} |")
+        final_score = f"{a.get('final_score', a.get('env_j1', 0.0)):.3f}"
+        rubric_score = f"{a.get('rubric_score', a.get('env_j1', 0.0)):.3f}"
+        llm_score = f"{a['llm_score']:.3f}" if a.get("llm_score") is not None else "—"
+        status = "pass" if a.get("passed_threshold", True) else "retry"
+        lines.append(f"| {a['step']} | `{a['tool']}` | {final_score} | {rubric_score} | {llm_score} | {status} |")
     if JUDGE_HISTORY:
         scores = [getattr(v, "total_score", 0) for v in JUDGE_HISTORY]
-        lines.append(f"\n**LLM Judge Avg:** `{sum(scores) / len(scores):.3f}`")
+        lines.append(f"\n**Average Final Score:** `{sum(scores) / len(scores):.3f}`")
     return "\n".join(lines)
 
 
@@ -1082,11 +1237,20 @@ with gr.Blocks(title="AGENT OS") as demo:
                     info="Type any OpenRouter-compatible model ID directly if it is not listed.",
                 )
                 judge_mode = gr.Radio(
-                    choices=["🤖 LLM Judge", "✍ Manual Judge", "⚖ Hybrid"],
-                    value="🤖 LLM Judge",
+                    choices=["🧩 Combined Judge", "🤖 LLM Judge", "🧮 Rubric Judge", "✍ Human Override"],
+                    value="🧩 Combined Judge",
                     label="Judge Mode",
                     scale=3,
                 )
+        with gr.Column(scale=2, min_width=220):
+            pass_threshold = gr.Slider(
+                minimum=0.0,
+                maximum=1.0,
+                value=0.60,
+                step=0.01,
+                label="Pass Threshold",
+                info="A step only advances when the final score meets or exceeds this threshold.",
+            )
 
     gr.HTML("<hr style='border:none;border-top:1px solid #e0e0e0;margin:12px 0'>")
 
@@ -1155,7 +1319,7 @@ with gr.Blocks(title="AGENT OS") as demo:
                 lines=5,
             )
 
-            with gr.Accordion("✍ Manual Judge Settings", open=False):
+            with gr.Accordion("✍ Human Override Settings", open=False):
                 manual_score = gr.Slider(
                     0, 100, value=70, step=1, label="Score (0–100)"
                 )
@@ -1170,7 +1334,7 @@ with gr.Blocks(title="AGENT OS") as demo:
     # ── ROW 3: J1 history | Judge verdict ──
     with gr.Row():
         with gr.Column(scale=1):
-            gr.HTML('<div class="block-title">J1 Score History</div>')
+            gr.HTML('<div class="block-title">Score History</div>')
             j1_display = gr.Markdown("_No steps yet._", elem_classes=["j1-box"])
         with gr.Column(scale=1):
             gr.HTML('<div class="block-title">Judge Verdict</div>')
@@ -1212,31 +1376,6 @@ with gr.Blocks(title="AGENT OS") as demo:
     with gr.Accordion("📜 Replay Log", open=False):
         replay_display = gr.Markdown("_No actions yet._")
 
-    # ── MCP Servers ──
-    with gr.Accordion("🔌 MCP Servers  (add external tool servers)", open=False):
-        gr.Markdown(
-            "Connect any SSE-based MCP server — its tools appear in the dropdown automatically."
-        )
-        with gr.Row():
-            mcp_name_in = gr.Textbox(
-                label="Server Name", placeholder="my-server", scale=1
-            )
-            mcp_url_in = gr.Textbox(
-                label="Server URL  (SSE endpoint)",
-                placeholder="http://localhost:8080/mcp",
-                scale=3,
-            )
-            mcp_connect_btn = gr.Button("Connect", scale=1)
-            mcp_disc_btn = gr.Button("Disconnect", scale=1, variant="stop")
-        mcp_status = gr.Markdown("_No MCP servers connected._")
-        gr.Markdown("**Call an MCP tool directly:**")
-        with gr.Row():
-            mcp_srv = gr.Textbox(label="Server Name", scale=1)
-            mcp_tool = gr.Textbox(label="Tool Name", scale=2)
-            mcp_args = gr.Textbox(label="Args (JSON)", value="{}", scale=3)
-            mcp_call_btn = gr.Button("Call", scale=1)
-        mcp_result = gr.Markdown("")
-
     # ── Action History ──
     with gr.Accordion("📊 Action History", open=False):
         hist_btn = gr.Button("Refresh", size="sm")
@@ -1275,6 +1414,7 @@ with gr.Blocks(title="AGENT OS") as demo:
             judge_mode,
             manual_score,
             manual_feedback,
+            pass_threshold,
             api_key,
             judge_model_dd,
         ],
@@ -1311,17 +1451,6 @@ with gr.Blocks(title="AGENT OS") as demo:
         ],
     )
 
-    mcp_connect_btn.click(
-        on_mcp_connect,
-        inputs=[mcp_name_in, mcp_url_in, role_dd],
-        outputs=[mcp_status, tool_dd],
-    )
-    mcp_disc_btn.click(
-        on_mcp_disconnect, inputs=[mcp_name_in, role_dd], outputs=[mcp_status, tool_dd]
-    )
-    mcp_call_btn.click(
-        on_mcp_call, inputs=[mcp_srv, mcp_tool, mcp_args], outputs=[mcp_result]
-    )
     hist_btn.click(on_history, outputs=[hist_display])
     state_btn.click(on_get_state, outputs=[state_display])
 

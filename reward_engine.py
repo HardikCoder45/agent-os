@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from judge_engine import run_llm_judge, FinalVerdict
 from task_graders import grade_task_action
+from tool_schemas import TOOL_REGISTRY, validate_args
 
 # ──────────────────────────────────────────────
 #  J1: Fast rule-based scorer
@@ -38,6 +39,90 @@ BONUS_PATTERNS = [
     (r"\b(risk|compliance|legal|regulatory|gdpr|soc2)\b", 0.03, "Risk/compliance awareness"),
     (r"\b(kpi|metric|benchmark|baseline|measurement)\b", 0.02, "Metrics awareness"),
 ]
+
+PLACEHOLDER_PATTERN = re.compile(r"\b(test|dummy|placeholder|todo|fixme|pass|null)\b", re.IGNORECASE)
+STRATEGIC_SIGNAL_WORDS = (
+    "tradeoff",
+    "risk",
+    "metric",
+    "timeline",
+    "success",
+    "goal",
+    "stakeholder",
+    "runway",
+    "dilution",
+    "retention",
+    "governance",
+    "budget",
+)
+
+
+def _clip(score: float) -> float:
+    return round(max(0.0, min(1.0, score)), 4)
+
+
+def _tokens(value: str) -> set[str]:
+    cleaned = re.sub(r"[^a-z0-9]+", " ", value.lower())
+    return {token for token in cleaned.split() if token}
+
+
+def _semantic_match(actual: Any, expected: Any) -> float:
+    if actual is None:
+        return 0.0
+    if isinstance(expected, (int, float)):
+        if not isinstance(actual, (int, float)):
+            return 0.0
+        if actual == expected:
+            return 1.0
+        if expected == 0:
+            return 0.0
+        return _clip(min(actual, expected) / max(actual, expected))
+    if isinstance(expected, str):
+        actual_text = str(actual).strip()
+        expected_text = expected.strip()
+        if not actual_text:
+            return 0.0
+        if actual_text.lower() == expected_text.lower():
+            return 1.0
+        actual_tokens = _tokens(actual_text)
+        expected_tokens = _tokens(expected_text)
+        if not expected_tokens:
+            return 0.5
+        overlap = len(actual_tokens & expected_tokens) / len(expected_tokens)
+        contains_bonus = 0.2 if expected_text.lower() in actual_text.lower() else 0.0
+        return _clip(overlap + contains_bonus)
+    return 1.0 if actual == expected else 0.0
+
+
+def blend_scores(manual_score: float, llm_score: Optional[float]) -> Tuple[float, Dict[str, Any]]:
+    manual_score = _clip(manual_score)
+    if llm_score is None:
+        return manual_score, {
+            "manual_weight": 1.0,
+            "llm_weight": 0.0,
+            "agreement_adjustment": 0.0,
+            "agreement_gap": None,
+            "method": "manual_only",
+        }
+
+    llm_score = _clip(llm_score)
+    gap = abs(manual_score - llm_score)
+    agreement_adjustment = 0.0
+    if gap <= 0.10:
+        agreement_adjustment = 0.03
+    elif gap >= 0.35:
+        agreement_adjustment = -0.04
+    elif gap >= 0.22:
+        agreement_adjustment = -0.02
+
+    final = _clip((manual_score * 0.55) + (llm_score * 0.45) + agreement_adjustment)
+    return final, {
+        "manual_weight": 0.55,
+        "llm_weight": 0.45,
+        "agreement_adjustment": agreement_adjustment,
+        "agreement_gap": _clip(gap),
+        "method": "manual_llm_blend",
+    }
 
 
 def j1_score(
@@ -116,10 +201,6 @@ def j1_score(
 #  Combined reward
 # ──────────────────────────────────────────────
 
-RULE_WEIGHT = 0.75
-LLM_WEIGHT = 0.25
-
-
 def compute_reward(
     agent_output: str,
     tool_name: str,
@@ -163,10 +244,18 @@ def compute_reward(
     # Hard gate: J1 zero means instant zero overall
     if base_score == 0.0:
         return 0.0, {
-            "j1_score": 0.0,
-            "j1_reasons": j1_reasons,
+            "manual_score": 0.0,
+            "manual_reasons": j1_reasons,
             "deterministic_grade": task_grade,
             "llm_verdict": None,
+            "llm_score": None,
+            "blend_detail": {
+                "manual_weight": 1.0,
+                "llm_weight": 0.0,
+                "agreement_adjustment": 0.0,
+                "agreement_gap": None,
+                "method": "instant_zero",
+            },
             "final_reward": 0.0,
             "method": "task_instant_zero" if task_grade else "j1_instant_zero",
         }
@@ -188,28 +277,33 @@ def compute_reward(
         except Exception:
             llm_verdict = None
 
+    llm_score: Optional[float] = None
+    blend_detail: Dict[str, Any]
     if llm_verdict is not None:
         if llm_verdict.instant_zero:
             return 0.0, {
-                "j1_score": base_score,
-                "j1_reasons": j1_reasons,
+                "manual_score": base_score,
+                "manual_reasons": j1_reasons,
                 "deterministic_grade": task_grade,
                 "llm_verdict": llm_verdict.model_dump(),
+                "llm_score": 0.0,
                 "final_reward": 0.0,
                 "method": "llm_instant_zero",
             }
         llm_score = llm_verdict.total_score
-        final = round(RULE_WEIGHT * base_score + LLM_WEIGHT * llm_score, 4)
-        method = "combined_task_llm" if task_grade else "combined_j1_llm"
+        final, blend_detail = blend_scores(base_score, llm_score)
+        method = "combined_task_llm" if task_grade else "combined_manual_llm"
     else:
-        final = base_score
-        method = "task_only" if task_grade else "j1_only"
+        final, blend_detail = blend_scores(base_score, None)
+        method = "task_only" if task_grade else "manual_only"
 
     return final, {
-        "j1_score": base_score,
-        "j1_reasons": j1_reasons,
+        "manual_score": base_score,
+        "manual_reasons": j1_reasons,
         "deterministic_grade": task_grade,
         "llm_verdict": llm_verdict.model_dump() if llm_verdict else None,
+        "llm_score": llm_score,
+        "blend_detail": blend_detail,
         "final_reward": final,
         "method": method,
     }
@@ -225,13 +319,61 @@ def score_reasoning(thinking: str, step: Any, shared_state: Dict) -> Tuple[float
     Legacy function - scores reasoning quality.
     Returns (score, breakdown_dict).
     """
-    if not thinking or len(thinking.strip()) < 20:
-        return 0.2, {"length": "too_short", "connectors": 0}
-    
-    connectors = sum(1 for kw in REASONING_KEYWORDS if kw in thinking.lower())
-    score = min(1.0, 0.4 + (connectors * 0.1))
-    
-    return score, {"length": len(thinking), "connectors": connectors}
+    cleaned = (thinking or "").strip()
+    if not cleaned:
+        return 0.0, {
+            "word_count": 0,
+            "connector_hits": 0,
+            "keyword_hit_ratio": 0.0,
+            "context_hit_ratio": 0.0,
+            "strategic_signal_ratio": 0.0,
+            "placeholder_language": False,
+        }
+
+    words = cleaned.split()
+    lower = cleaned.lower()
+    connectors = sum(1 for kw in REASONING_KEYWORDS if kw in lower)
+    keyword_ratio = 0.0
+    context_ratio = 0.0
+    strategic_ratio = 0.0
+
+    optimal_keywords = getattr(step, "optimal_reasoning_keywords", []) or []
+    if optimal_keywords:
+        keyword_ratio = len([kw for kw in optimal_keywords if kw.lower() in lower]) / len(optimal_keywords)
+
+    context_tokens = _tokens(
+        f"{getattr(step, 'question', '')} {getattr(step, 'context', '')} "
+        f"{getattr(step, 'counterfactual_tip', '')}"
+    )
+    if context_tokens:
+        context_ratio = len(context_tokens & _tokens(cleaned)) / len(context_tokens)
+
+    strategic_hits = sum(1 for word in STRATEGIC_SIGNAL_WORDS if word in lower)
+    strategic_ratio = min(1.0, strategic_hits / 5)
+    placeholder_language = bool(PLACEHOLDER_PATTERN.search(cleaned))
+
+    score = 0.08
+    score += min(0.18, len(words) / 55 * 0.18)
+    score += min(0.16, connectors * 0.04)
+    score += min(0.28, keyword_ratio * 0.28)
+    score += min(0.14, context_ratio * 0.14)
+    score += min(0.16, strategic_ratio * 0.16)
+
+    if len(words) < 18:
+        score -= 0.10
+    if connectors == 0:
+        score -= 0.06
+    if placeholder_language:
+        score -= 0.25
+
+    return _clip(score), {
+        "word_count": len(words),
+        "connector_hits": connectors,
+        "keyword_hit_ratio": _clip(keyword_ratio),
+        "context_hit_ratio": _clip(context_ratio),
+        "strategic_signal_ratio": _clip(strategic_ratio),
+        "placeholder_language": placeholder_language,
+    }
 
 
 def score_tool_arguments(tool_name: str, tool_args: Dict, step: Any) -> Tuple[float, List[str], List[str]]:
@@ -241,21 +383,67 @@ def score_tool_arguments(tool_name: str, tool_args: Dict, step: Any) -> Tuple[fl
     """
     errors = []
     hints = []
-    
+
     if not tool_name:
         errors.append("No tool specified")
         return 0.0, errors, hints
-    
-    if not tool_args:
-        errors.append("Empty arguments")
-        return 0.3, errors, hints
-    
-    score = 0.7 if len(tool_args) >= 2 else 0.5
-    
-    if len(tool_args) >= 3:
-        hints.append("Good argument coverage")
-    
-    return score, errors, hints
+
+    required_tool = getattr(step, "required_tool", "")
+    if required_tool and tool_name != required_tool:
+        errors.append(f"Expected tool `{required_tool}`, got `{tool_name}`")
+
+    schema = TOOL_REGISTRY.get(tool_name)
+    arg_quality = 0.0
+    validation_ok = False
+    if schema is not None:
+        validation_ok, arg_errors, arg_quality = validate_args(schema, tool_args)
+        errors.extend(arg_errors)
+    else:
+        errors.append(f"No schema found for tool `{tool_name}`")
+
+    expected_args = getattr(step, "required_args_hints", {}) or {}
+    if expected_args:
+        provided_required = sum(1 for name in expected_args if name in tool_args and tool_args.get(name) not in (None, "", []))
+        coverage_ratio = provided_required / len(expected_args)
+    else:
+        coverage_ratio = 0.5 if tool_args else 0.0
+
+    optimal_args = getattr(step, "optimal_args", {}) or {}
+    if optimal_args:
+        semantic_scores = [_semantic_match(tool_args.get(key), expected) for key, expected in optimal_args.items()]
+        optimal_alignment = sum(semantic_scores) / len(semantic_scores)
+    else:
+        optimal_alignment = 0.5 if tool_args else 0.0
+
+    richness_scores = []
+    for value in tool_args.values():
+        if isinstance(value, str):
+            richness_scores.append(min(1.0, len(value.split()) / 10))
+        elif isinstance(value, (int, float)):
+            richness_scores.append(0.9)
+        else:
+            richness_scores.append(0.7)
+    arg_richness = sum(richness_scores) / len(richness_scores) if richness_scores else 0.0
+
+    tool_match_score = 1.0 if not required_tool or tool_name == required_tool else 0.12
+    score = (
+        tool_match_score * 0.40
+        + arg_quality * 0.20
+        + coverage_ratio * 0.20
+        + optimal_alignment * 0.15
+        + arg_richness * 0.05
+    )
+
+    if coverage_ratio < 0.75:
+        missing = [name for name in expected_args if name not in tool_args or tool_args.get(name) in (None, "", [])]
+        if missing:
+            hints.append(f"Add the missing core args: {', '.join(missing[:4])}")
+    if optimal_alignment < 0.65 and optimal_args:
+        hints.append("Match the step's expected direction more closely with scenario-specific values.")
+    if validation_ok and coverage_ratio >= 0.8:
+        hints.append("Argument structure is solid.")
+
+    return _clip(score), errors, hints
 
 
 def score_subagent_decision(used_subagent: bool, step: Any, subagent_result: Optional[str]) -> float:
@@ -277,16 +465,16 @@ def compute_j1(reasoning_score: float, tool_arg_score: float, subagent_score: fl
     Legacy function - computes J1 score.
     Returns combined score.
     """
-    base = (reasoning_score * 0.4 + tool_arg_score * 0.4 + subagent_score * 0.2)
+    base = (reasoning_score * 0.45 + tool_arg_score * 0.45 + subagent_score * 0.10)
     
     tier_bonus = {
-        "excellent": 0.1,
-        "good": 0.05,
+        "excellent": 0.06,
+        "good": 0.03,
         "acceptable": 0.0,
-        "poor": -0.1,
+        "poor": -0.06,
     }.get(rubric_tier, 0.0)
-    
-    return max(0.0, min(1.0, base + tier_bonus))
+
+    return _clip(base + tier_bonus)
 
 
 def compute_j2(goal_achieved: bool, steps_used: int, max_steps: int, 
@@ -327,11 +515,24 @@ def generate_counterfactual(step: Any, j1: float, reasoning_breakdown: Dict, too
     Legacy function - generates counterfactual feedback.
     Returns feedback string.
     """
+    required_tool = getattr(step, "required_tool", "the expected tool")
+    connector_hits = reasoning_breakdown.get("connector_hits", 0)
+    keyword_ratio = reasoning_breakdown.get("keyword_hit_ratio", 0.0)
+
     if j1 >= 0.8:
-        return "Strong performance. Consider exploring alternative approaches for even better results."
-    elif j1 >= 0.6:
-        return f"Good attempt. Improvements: {', '.join(tool_hints) if tool_hints else 'add more detailed reasoning'}"
-    elif j1 >= 0.4:
-        return f"Needs improvement. Issues: {reasoning_breakdown.get('connectors', 0)} reasoning connectors found. Add more structured thinking."
-    else:
-        return "Poor performance. Review the task requirements and provide detailed reasoning with proper tool arguments."
+        return (
+            f"Strong performance. Keep the same direction and sharpen the next move with explicit metrics, "
+            f"stakeholder impact, and why `{required_tool}` is still the right tool."
+        )
+    if j1 >= 0.6:
+        improvement = ", ".join(tool_hints[:2]) if tool_hints else "tighten the argument details and make the tradeoffs explicit"
+        return f"Solid attempt. To score higher, keep `{required_tool}` but {improvement}."
+    if j1 >= 0.4:
+        return (
+            f"Needs improvement. Your reasoning only showed {connector_hits} structured connectors and "
+            f"{keyword_ratio:.2f} keyword alignment. Use `{required_tool}` with more scenario-specific numbers, risks, and success criteria."
+        )
+    return (
+        f"Low-scoring move. Re-anchor on the step objective, use `{required_tool}` if appropriate, and answer with "
+        "complete args, explicit tradeoffs, concrete metrics, and direct scenario grounding."
+    )

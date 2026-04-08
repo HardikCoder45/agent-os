@@ -182,9 +182,17 @@ class MultiAgentEnvironment:
         return {
             "step": self.step_count,
             "j1": j1,
+            "manual_score": j1,
             "j2": j2,
             "done": done,
             "reasoning_breakdown": reasoning_breakdown,
+            "manual_breakdown": {
+                "reasoning_score": reasoning_score,
+                "tool_arg_score": tool_arg_score,
+                "subagent_score": subagent_score,
+                "rubric_tier": rubric_tier,
+                "tool_hints": tool_hints,
+            },
             "tool_errors": tool_errors,
             "counterfactual": counterfactual,
             "cross_agent_log": self.cross_agent_log[-3:],
