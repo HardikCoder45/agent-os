@@ -7,7 +7,6 @@ sdk: gradio
 app_file: app.py
 pinned: false
 license: bsd-3-clause
-short_description: Multi-agent environment with LLM judge for business scenarios
 ---
 
 # 🤖 Agent Environment - Multi-Agent Hackathon
