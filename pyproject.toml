@@ -8,6 +8,7 @@ version = "1.0.0"
 description = "Hackathon environment for OpenEnv"
 requires-python = ">=3.10"
 dependencies = [
+    "gradio>=6.10.0",
     "openai>=1.75.0",
     "openenv-core[core]>=0.2.2",
     "pydantic>=2.12.5",
@@ -18,9 +19,6 @@ dependencies = [
 dev = [
     "pytest>=8.0.0",
     "pytest-cov>=4.0.0",
-]
-ui = [
-    "gradio>=6.10.0",
 ]
 
 [project.scripts]

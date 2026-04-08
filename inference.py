@@ -29,7 +29,8 @@ from hackathon_environment import HackathonAction, HackathonEnvironment
 from task_graders import grade_episode
 
 
-API_BASE_URL = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+API_BASE_URL = OPENROUTER_BASE_URL
 MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 OUTPUT_DIR = Path("outputs")

@@ -15,10 +15,12 @@ while adding:
 from __future__ import annotations
 
 import json
+import os
 import traceback
 from typing import Any, Dict, List, Optional, Tuple
 
 import gradio as gr
+from openai import OpenAI
 
 # ── Local imports ──
 try:
@@ -163,15 +165,17 @@ SPECIALIST_ROLES = [
 ]
 
 DEFAULT_MODELS = [
-    "anthropic/claude-3.5-sonnet",
-    "anthropic/claude-3-haiku",
     "openai/gpt-4o",
-    "openai/gpt-4o-mini",
-    "google/gemini-pro-1.5",
-    "meta-llama/llama-3.1-70b-instruct",
+    "openai/gpt-4.1-mini",
+    "anthropic/claude-3.5-sonnet",
+    "google/gemini-2.5-pro-preview",
+    "meta-llama/llama-3.3-70b-instruct",
     "qwen/qwen-2.5-72b-instruct",
     "Custom (type below)"
 ]
+
+DEFAULT_API_BASE_URL = "https://openrouter.ai/api/v1"
+DEFAULT_MODEL_NAME = os.environ.get("MODEL_NAME", DEFAULT_MODELS[0])
 
 
 # ─────────────────────────────────────────────
@@ -396,7 +400,7 @@ def on_step(
     judge_mode: str,
     manual_score: float,
     manual_feedback: str,
-    openrouter_key: str,
+    api_key: str,
     judge_model: str,
 ):
     global OBS, ACTION_HISTORY, JUDGE_HISTORY
@@ -476,8 +480,8 @@ def on_step(
     )
 
     if judge_mode == "🤖 LLM Judge":
-        if not openrouter_key.strip():
-            verdict_md = "⚠ Enter your OpenRouter API key in the Config panel to use LLM judging."
+        if not api_key.strip():
+            verdict_md = "⚠ Enter your API key in the Config panel to use LLM judging."
         else:
             try:
                 role_tools = _tools_for_role(role)
@@ -511,11 +515,21 @@ def on_step(
                         "title": OBS.get("scenario_title", ""),
                         "goal": OBS.get("scenario_goal", ""),
                         "briefing": OBS.get("scenario_briefing", ""),
+                        "domain": getattr(ENV, "domain", ""),
+                        "role": role,
                     },
-                    step_context={"step": step_idx, "env_j1": env_j1},
+                    step_context={
+                        "step": step_idx,
+                        "total_steps": total,
+                        "step_id": OBS.get("step_id", ""),
+                        "question": OBS.get("step_question", ""),
+                        "context": OBS.get("step_context", ""),
+                        "env_j1": env_j1,
+                    },
                     available_tools=list(role_tools.keys()),
                     previous_actions=ACTION_HISTORY[-5:],
-                    api_key=openrouter_key.strip(),
+                    api_base_url=DEFAULT_API_BASE_URL,
+                    api_key=api_key.strip(),
                     model=judge_model,
                 )
                 verdict_md = _render_verdict(verdict)
@@ -558,16 +572,18 @@ def on_step(
 
 
 def on_subagent(
-    role: str, specialist: str, question: str, openrouter_key: str, judge_model: str
+    role: str,
+    specialist: str,
+    question: str,
+    api_key: str,
+    judge_model: str,
 ):
     if not specialist or not question.strip():
         return "Select a specialist and enter a question."
     if ENV is None:
         return "⚠ Start a scenario first."
     try:
-        if openrouter_key.strip():
-            import requests
-
+        if api_key.strip():
             scenario_ctx = (
                 f"Domain: {ENV.domain}. "
                 f"Scenario: {OBS.get('scenario_title', '')}. "
@@ -578,25 +594,20 @@ def on_subagent(
                 f"Context: {scenario_ctx} "
                 "Give concise, actionable advice in 3-5 sentences. Be specific, cite numbers."
             )
-            resp = requests.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {openrouter_key.strip()}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": judge_model,
-                    "messages": [
-                        {"role": "system", "content": sys_prompt},
-                        {"role": "user", "content": question},
-                    ],
-                    "max_tokens": 400,
-                    "temperature": 0.5,
-                },
-                timeout=30,
+            client = OpenAI(
+                base_url=DEFAULT_API_BASE_URL,
+                api_key=api_key.strip(),
             )
-            resp.raise_for_status()
-            answer = resp.json()["choices"][0]["message"]["content"]
+            resp = client.chat.completions.create(
+                model=judge_model,
+                messages=[
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": question},
+                ],
+                max_tokens=400,
+                temperature=0.5,
+            )
+            answer = resp.choices[0].message.content or ""
             return f"**🤖 {specialist}:**\n\n{answer}"
         else:
             answer = ENV.invoke_subagent(specialist, question, "")
@@ -756,40 +767,319 @@ def on_history():
 #  CSS
 # ─────────────────────────────────────────────
 CSS = """
-body,.gradio-container { font-family:'Inter',system-ui,sans-serif !important; }
-.tool-guide-box { background:#f8f9fc;border-radius:8px;padding:14px 16px;border-left:3px solid #6c63ff; }
-.verdict-box { background:#f0f4ff;border-radius:8px;padding:14px 16px;border-left:3px solid #43a047; }
-.j1-box { background:#fffde7;border-radius:8px;padding:10px 14px;border-left:3px solid #f9a825; }
-.step-box { background:#fff;border-radius:8px;padding:16px;border:1px solid #e0e0e0; }
-.scenario-box { background:#f3f0ff;border-radius:8px;padding:14px;border-left:3px solid #7c4dff; }
-.gr-button.primary { border-radius:7px !important;font-weight:600 !important; }
-footer { display:none !important; }
+@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700;800&family=IBM+Plex+Mono:wght@400;500&display=swap');
+
+:root {
+  --bg: #f4efe6;
+  --panel: rgba(255, 252, 247, 0.94);
+  --panel-strong: rgba(255, 248, 240, 0.98);
+  --ink: #1f2430;
+  --muted: #5c6470;
+  --line: rgba(94, 88, 80, 0.16);
+  --accent: #cb5e3d;
+  --accent-deep: #9f4225;
+  --accent-soft: #f4cdb7;
+  --gold: #d78d2f;
+  --sage: #315b51;
+}
+
+body,
+.gradio-container {
+  font-family: 'Manrope', system-ui, sans-serif !important;
+  background:
+    radial-gradient(circle at top left, rgba(215, 141, 47, 0.14), transparent 26%),
+    radial-gradient(circle at top right, rgba(49, 91, 81, 0.12), transparent 24%),
+    linear-gradient(180deg, #f8f3eb 0%, #efe6d9 100%) !important;
+  color: var(--ink) !important;
+}
+
+.gradio-container {
+  max-width: 1440px !important;
+}
+
+h1, h2, h3, h4, .prose h1, .prose h2, .prose h3 {
+  font-family: 'Manrope', system-ui, sans-serif !important;
+  letter-spacing: -0.02em;
+}
+
+.hero-shell {
+  background:
+    linear-gradient(135deg, rgba(24, 31, 41, 0.98), rgba(53, 37, 29, 0.96)),
+    linear-gradient(90deg, rgba(203, 94, 61, 0.16), rgba(215, 141, 47, 0.1));
+  color: #fffaf5;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 24px;
+  padding: 24px 28px;
+  box-shadow: 0 24px 80px rgba(45, 28, 20, 0.18);
+}
+
+.hero-kicker {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.78rem;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: #ffd7b2;
+}
+
+.hero-title {
+  margin-top: 10px;
+  font-size: 3rem;
+  font-weight: 800;
+  line-height: 0.95;
+}
+
+.hero-subtitle {
+  margin-top: 10px;
+  max-width: 900px;
+  font-size: 1rem;
+  line-height: 1.65;
+  color: rgba(255, 246, 238, 0.84);
+}
+
+.hero-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 18px;
+}
+
+.hero-stat {
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 16px;
+  padding: 14px 16px;
+}
+
+.hero-stat-label {
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: rgba(255, 226, 204, 0.74);
+}
+
+.hero-stat-value {
+  margin-top: 4px;
+  font-size: 1rem;
+  font-weight: 700;
+}
+
+.block-title {
+  font-size: 1.1rem;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  margin-bottom: 6px;
+}
+
+.tool-guide-box,
+.verdict-box,
+.j1-box,
+.step-box,
+.scenario-box,
+.state-box {
+  background: var(--panel);
+  border-radius: 18px;
+  padding: 16px 18px;
+  border: 1px solid var(--line);
+  box-shadow: 0 12px 40px rgba(82, 55, 39, 0.06);
+  backdrop-filter: blur(12px);
+}
+
+.tool-guide-box { border-left: 4px solid var(--accent); }
+.verdict-box { border-left: 4px solid var(--sage); }
+.j1-box { border-left: 4px solid var(--gold); }
+.step-box { border-left: 4px solid #4b657f; }
+.scenario-box { border-left: 4px solid #8d5f3a; }
+.state-box { border-left: 4px solid #6b7280; }
+
+.tool-guide-box,
+.tool-guide-box *,
+.verdict-box,
+.verdict-box *,
+.j1-box,
+.j1-box *,
+.step-box,
+.step-box *,
+.scenario-box,
+.scenario-box *,
+.state-box,
+.state-box * {
+  color: var(--ink) !important;
+}
+
+.hero-shell code,
+.tool-guide-box code,
+.verdict-box code,
+.j1-box code,
+.step-box code,
+.scenario-box code,
+.state-box code,
+pre,
+pre code {
+  color: #1f2430 !important;
+  background: rgba(49, 61, 74, 0.08) !important;
+  border-radius: 8px;
+}
+
+.gr-button {
+  border-radius: 14px !important;
+  font-weight: 700 !important;
+  border: 1px solid rgba(32, 37, 45, 0.08) !important;
+}
+
+.gr-button.primary {
+  background: linear-gradient(135deg, var(--accent), var(--accent-deep)) !important;
+  color: #fff !important;
+}
+
+.gr-button.secondary {
+  background: linear-gradient(135deg, #f6ddc9, #efd0b2) !important;
+  color: #4a3427 !important;
+}
+
+.gr-accordion {
+  border: 1px solid var(--line) !important;
+  border-radius: 18px !important;
+  background: var(--panel-strong) !important;
+}
+
+.gr-accordion,
+.gr-accordion *,
+.gr-markdown,
+.gr-markdown *,
+.gr-form,
+.gr-form *,
+.gr-panel,
+.gr-panel *,
+.gr-box,
+.gr-box * {
+  color: var(--ink) !important;
+}
+
+.gr-box,
+.gr-form,
+.gr-panel {
+  border-color: var(--line) !important;
+  background: var(--panel-strong) !important;
+}
+
+label,
+.gr-block-label,
+.gradio-container label,
+.gradio-container .gr-form .form,
+.gradio-container .gr-markdown p,
+.gradio-container .gr-markdown li,
+.gradio-container .gr-markdown strong,
+.gradio-container .gr-markdown em,
+.gradio-container .gr-markdown td,
+.gradio-container .gr-markdown th,
+.gradio-container .gr-markdown h1,
+.gradio-container .gr-markdown h2,
+.gradio-container .gr-markdown h3,
+.gradio-container .gr-markdown h4 {
+  color: var(--ink) !important;
+}
+
+input,
+textarea,
+select,
+.gradio-container input,
+.gradio-container textarea,
+.gradio-container select {
+  color: var(--ink) !important;
+  background: #fffaf5 !important;
+  border-color: rgba(94, 88, 80, 0.22) !important;
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: #7b6f65 !important;
+  opacity: 1 !important;
+}
+
+.gradio-container table,
+.gradio-container tr,
+.gradio-container td,
+.gradio-container th {
+  color: var(--ink) !important;
+}
+
+.gradio-container .secondary-text,
+.gradio-container .prose,
+.gradio-container .prose p,
+.gradio-container .prose li {
+  color: var(--ink) !important;
+}
+
+textarea,
+input,
+select {
+  font-family: 'IBM Plex Mono', monospace !important;
+}
+
+footer { display: none !important; }
+
+@media (max-width: 900px) {
+  .hero-title { font-size: 2.3rem; }
+  .hero-grid { grid-template-columns: 1fr; }
+}
 """
 
 
 # ─────────────────────────────────────────────
 #  Gradio UI
 # ─────────────────────────────────────────────
-with gr.Blocks(title="Agent OS  ") as demo:
+with gr.Blocks(title="AGENT OS") as demo:
     # ── TOP: title + config ──
+    gr.HTML(f"<style>{CSS}</style>")
+    gr.HTML(
+        f"""
+        <section class="hero-shell">
+          <div class="hero-kicker">Agentic Evaluation System</div>
+          <div class="hero-title">AGENT OS</div>
+          <div class="hero-subtitle">
+            A stronger multi-agent operating system for scenario execution, interactive LLM judging,
+            specialist consultation, replay analysis, and OpenEnv-compatible evaluation. The OpenAI client
+            is fixed to the OpenRouter-compatible endpoint: <code>{DEFAULT_API_BASE_URL}</code>.
+          </div>
+          <div class="hero-grid">
+            <div class="hero-stat">
+              <div class="hero-stat-label">Eval Depth</div>
+              <div class="hero-stat-value">10 steps minimum per scenario</div>
+            </div>
+            <div class="hero-stat">
+              <div class="hero-stat-label">Judge Stack</div>
+              <div class="hero-stat-value">OpenAI SDK + multi-axis LLM rubric</div>
+            </div>
+            <div class="hero-stat">
+              <div class="hero-stat-label">Operator View</div>
+              <div class="hero-stat-value">Goal, situation, step question, replay, state, and sub-agents</div>
+            </div>
+          </div>
+        </section>
+        """
+    )
+
     with gr.Row():
-        gr.HTML(
-            '<div style="font-size:1.7em;font-weight:700;padding:6px 2px">🤖 Agent OS--  Multi Ai Agents controlling comapany</div>'
-        )
-        with gr.Column(scale=2, min_width=200):
-            openrouter_key = gr.Textbox(
-                label="OpenRouter API Key", placeholder="sk-or-v1-...", type="password"
+        with gr.Column(scale=2, min_width=220):
+            api_key = gr.Textbox(
+                label="OpenRouter API Key",
+                placeholder="sk-or-v1-...",
+                type="password",
+                info="Used through the OpenAI client with the fixed OpenRouter endpoint.",
             )
         with gr.Column(scale=4):
             with gr.Row():
                 judge_model_dd = gr.Dropdown(
                     choices=DEFAULT_MODELS,
-                    value=DEFAULT_MODELS[0],
-                    label="Judge Model (select preset or type any OpenRouter model ID)",
+                    value=DEFAULT_MODEL_NAME,
+                    label="Model Name",
                     allow_custom_value=True,
                     interactive=True,
                     scale=4,
-                    info="You can type any OpenRouter model name directly"
+                    info="Type any OpenRouter-compatible model ID directly if it is not listed.",
                 )
                 judge_mode = gr.Radio(
                     choices=["🤖 LLM Judge", "✍ Manual Judge", "⚖ Hybrid"],
@@ -803,7 +1093,7 @@ with gr.Blocks(title="Agent OS  ") as demo:
     # ── ROW 1: Setup + Agent header ──
     with gr.Row():
         with gr.Column(scale=1):
-            gr.Markdown("### ⚙ Scenario Setup")
+            gr.HTML('<div class="block-title">Scenario Setup</div>')
             with gr.Row():
                 domain_dd = gr.Dropdown(
                     choices=DOMAIN_LIST, value=DOMAIN_LIST[0], label="Domain"
@@ -815,7 +1105,9 @@ with gr.Blocks(title="Agent OS  ") as demo:
                     else None,
                     label="Agent Role",
                 )
-            start_btn = gr.Button("▶  Start Scenario", variant="primary", size="lg")
+            with gr.Row():
+                start_btn = gr.Button("Start Scenario", variant="primary", size="lg")
+                reset_btn = gr.Button("Reset Scenario", variant="secondary", size="lg")
         with gr.Column(scale=2):
             agent_header = gr.HTML(
                 '<div style="background:#f0f0f0;border-radius:10px;padding:20px;'
@@ -827,6 +1119,7 @@ with gr.Blocks(title="Agent OS  ") as demo:
     # ── ROW 2: Scenario brief + Step | Action panel ──
     with gr.Row(equal_height=False):
         with gr.Column(scale=1):
+            gr.HTML('<div class="block-title">Live Scenario</div>')
             scenario_display = gr.Markdown(
                 "_Start a scenario._", elem_classes=["scenario-box"]
             )
@@ -836,7 +1129,7 @@ with gr.Blocks(title="Agent OS  ") as demo:
             )
 
         with gr.Column(scale=1):
-            gr.Markdown("### 🛠 Take Action")
+            gr.HTML('<div class="block-title">Action Workspace</div>')
             tool_dd = gr.Dropdown(
                 choices=[],
                 label="Select Tool",
@@ -877,13 +1170,21 @@ with gr.Blocks(title="Agent OS  ") as demo:
     # ── ROW 3: J1 history | Judge verdict ──
     with gr.Row():
         with gr.Column(scale=1):
-            gr.Markdown("### 📈 J1 Score History")
+            gr.HTML('<div class="block-title">J1 Score History</div>')
             j1_display = gr.Markdown("_No steps yet._", elem_classes=["j1-box"])
         with gr.Column(scale=1):
-            gr.Markdown("### ⚖ Judge Verdict")
+            gr.HTML('<div class="block-title">Judge Verdict</div>')
             verdict_display = gr.Markdown(
                 "_Submit an action to see the verdict._", elem_classes=["verdict-box"]
             )
+
+    gr.HTML("<hr style='border:none;border-top:1px solid #e0e0e0;margin:12px 0'>")
+
+    # ── State inspector ──
+    with gr.Accordion("🛰 Environment State", open=False):
+        with gr.Row():
+            state_btn = gr.Button("Refresh Current State", variant="secondary")
+        state_display = gr.Markdown("_No active environment._", elem_classes=["state-box"])
 
     gr.HTML("<hr style='border:none;border-top:1px solid #e0e0e0;margin:12px 0'>")
 
@@ -974,7 +1275,7 @@ with gr.Blocks(title="Agent OS  ") as demo:
             judge_mode,
             manual_score,
             manual_feedback,
-            openrouter_key,
+            api_key,
             judge_model_dd,
         ],
         outputs=[
@@ -988,8 +1289,26 @@ with gr.Blocks(title="Agent OS  ") as demo:
 
     summon_btn.click(
         on_subagent,
-        inputs=[role_dd, specialist_dd, subagent_q, openrouter_key, judge_model_dd],
+        inputs=[role_dd, specialist_dd, subagent_q, api_key, judge_model_dd],
         outputs=[subagent_out],
+    )
+
+    reset_btn.click(
+        on_reset,
+        inputs=[domain_dd, role_dd],
+        outputs=[
+            agent_header,
+            scenario_display,
+            step_display,
+            tool_dd,
+            tool_guide,
+            args_input,
+            reasoning_input,
+            verdict_display,
+            j1_display,
+            progress_md,
+            replay_display,
+        ],
     )
 
     mcp_connect_btn.click(
@@ -1004,6 +1323,7 @@ with gr.Blocks(title="Agent OS  ") as demo:
         on_mcp_call, inputs=[mcp_srv, mcp_tool, mcp_args], outputs=[mcp_result]
     )
     hist_btn.click(on_history, outputs=[hist_display])
+    state_btn.click(on_get_state, outputs=[state_display])
 
 
 if __name__ == "__main__":

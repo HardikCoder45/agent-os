@@ -1,5 +1,6 @@
 from __future__ import annotations
-import random
+
+from dataclasses import replace
 from typing import Any
 from agents import AGENTS, AgentDefinition, AgentScenario, AgentStep
 from reward_engine import (score_reasoning, score_tool_arguments, score_subagent_decision,
@@ -50,6 +51,19 @@ def get_subagent_response(agent_role: str, context_key: str = "default") -> str:
 
 
 class MultiAgentEnvironment:
+    MIN_EVAL_STEPS = 10
+    FOLLOWUP_STAGE_LABELS = [
+        "signal scan",
+        "constraint mapping",
+        "stakeholder alignment",
+        "execution design",
+        "risk hardening",
+        "metric checkpoint",
+        "cross-functional review",
+        "decision revision",
+        "escalation planning",
+        "final verification",
+    ]
 
     def __init__(self, domain: str):
         self.domain = domain
@@ -92,7 +106,7 @@ class MultiAgentEnvironment:
         self.replay = []
         self.cross_agent_log = []
 
-        scenario = defn.scenarios[0]
+        scenario = self._expand_scenario(defn.scenarios[0])
         self.current_scenario = scenario
         self.shared_state = {}
         for k, v in scenario.initial_state_overrides.items():
@@ -225,3 +239,79 @@ class MultiAgentEnvironment:
             "j1_history": self.j1_history,
             "cross_agent_log": self.cross_agent_log,
         }
+
+    def _expand_scenario(self, scenario: AgentScenario) -> AgentScenario:
+        if len(scenario.steps) >= self.MIN_EVAL_STEPS and scenario.max_steps >= self.MIN_EVAL_STEPS:
+            return scenario
+
+        original_steps = list(scenario.steps)
+        expanded_steps = list(original_steps)
+        base_count = len(original_steps)
+
+        while len(expanded_steps) < self.MIN_EVAL_STEPS:
+            source_idx = len(expanded_steps) % base_count
+            source_step = original_steps[source_idx]
+            step_no = len(expanded_steps) + 1
+            stage_label = self.FOLLOWUP_STAGE_LABELS[(step_no - base_count - 1) % len(self.FOLLOWUP_STAGE_LABELS)]
+            expanded_steps.append(self._make_followup_step(source_step, scenario, step_no, stage_label))
+
+        expanded_briefing = scenario.briefing
+        if "10-step evaluation track" not in expanded_briefing:
+            expanded_briefing = (
+                f"{scenario.briefing}\n\n"
+                "Evaluation track: this scenario is expanded into a 10-step operating cadence so the "
+                "agent must reason through the full arc from diagnosis to execution and review."
+            )
+
+        return replace(
+            scenario,
+            briefing=expanded_briefing,
+            max_steps=max(scenario.max_steps, self.MIN_EVAL_STEPS),
+            steps=expanded_steps,
+        )
+
+    def _make_followup_step(
+        self,
+        source_step: AgentStep,
+        scenario: AgentScenario,
+        step_no: int,
+        stage_label: str,
+    ) -> AgentStep:
+        stage_suffix = stage_label.title()
+        refined_hints = dict(source_step.required_args_hints)
+        if "success_criteria" not in refined_hints:
+            refined_hints["success_criteria"] = "State the measurable outcome you expect from this move"
+        if "risk_if_wrong" not in refined_hints:
+            refined_hints["risk_if_wrong"] = "Name the downside if this decision is poorly executed"
+
+        scoring_rubric = dict(source_step.scoring_rubric)
+        scoring_rubric.setdefault(
+            "0.9-1.0",
+            "Shows scenario awareness, measurable execution details, and clear risk management.",
+        )
+
+        next_question = (
+            f"Step {step_no}: {stage_suffix}. "
+            f"How do you use `{source_step.required_tool}` now to push the scenario toward '{scenario.goal}' "
+            "while proving progress with explicit metrics, stakeholder communication, and risk controls?"
+        )
+        next_context = (
+            f"Carry forward the same operating constraints from '{scenario.title}'. "
+            f"This is the {stage_label} checkpoint, so your answer should tighten execution details beyond "
+            f"the earlier '{source_step.step_id}' decision. Re-state the key tradeoff, show what changed "
+            "since the previous move, and explain how you would validate success before the next turn."
+        )
+        next_tip = (
+            f"High-scoring follow-up: keep using `{source_step.required_tool}` with sharper metrics, a concrete "
+            f"{stage_label} update, and explicit downside management tied to '{scenario.goal}'."
+        )
+
+        return replace(
+            source_step,
+            step_id=f"{source_step.step_id}_eval_{step_no}",
+            question=next_question,
+            context=next_context,
+            required_args_hints=refined_hints,
+            scoring_rubric=scoring_rubric,
+            counterfactual_tip=next_tip,
+        )

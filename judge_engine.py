@@ -1,18 +1,7 @@
 """
-judge_engine.py — Ultra-strong multi-dimensional LLM judge for the hackathon environment.
+judge_engine.py — multi-dimensional LLM judge for the hackathon environment.
 
-Architecture:
-  LangGraph graph with nodes:
-    1. parse_action        – extract tool call, args, reasoning from agent output
-    2. hard_rule_check     – instant disqualifications / bonuses
-    3. tool_validity_judge – did agent call a real tool with valid args?
-    4. reasoning_judge     – did agent reason well before acting?
-    5. task_alignment_judge– does the action actually advance the task?
-    6. strategic_judge     – long-horizon / scenario-level quality
-    7. risk_judge          – safety, irreversibility, catastrophic moves
-    8. aggregate           – weighted average + final verdict + feedback
-
-All LLM calls go through OpenRouter.  Structured output via Pydantic + LangChain.
+All LLM calls use the OpenAI client against the fixed OpenRouter-compatible endpoint.
 """
 
 from __future__ import annotations
@@ -24,6 +13,8 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 from openai import OpenAI
+
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 
 # ─────────────────────────────────────────────
@@ -127,8 +118,8 @@ class JudgeState(BaseModel):
 #  Helper: call OpenRouter
 # ─────────────────────────────────────────────
 
-JUDGE_SYSTEM = """You are an EXPERT reinforcement-learning environment judge.
-Your role is to evaluate AI agent actions with extreme rigor and precision.
+JUDGE_SYSTEM = """You are an expert reinforcement-learning environment judge.
+Evaluate AI agent actions with extreme rigor and precision.
 
 ABSOLUTE PRINCIPLES:
 - Be brutally honest — never inflate scores.
@@ -136,6 +127,8 @@ ABSOLUTE PRINCIPLES:
 - Consider ALL evidence in the agent output.
 - Penalize heavily: empty reasoning, hallucinated tools, irrelevant actions.
 - Reward: clear multi-step reasoning, precise tool args, strategic awareness.
+- Tie every score to scenario evidence, current-step evidence, and action details.
+- Prefer lower scores when evidence is weak or implied rather than explicit.
 
 OUTPUT: Always respond ONLY with valid JSON matching the schema you are given. No extra text."""
 
@@ -144,7 +137,7 @@ def _llm_call(api_base_url: str, api_key: str, model: str, user_prompt: str, sch
     """Call an OpenAI-compatible chat endpoint and return raw JSON text."""
     try:
         client = OpenAI(
-            base_url=api_base_url or os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1"),
+            base_url=api_base_url or OPENROUTER_BASE_URL,
             api_key=api_key,
         )
         response = client.chat.completions.create(
@@ -611,7 +604,7 @@ def run_llm_judge(
         step_context=step_context,
         available_tools=available_tools,
         previous_actions=previous_actions,
-        api_base_url=api_base_url or os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1"),
+        api_base_url=api_base_url or OPENROUTER_BASE_URL,
         api_key=api_key,
         model=model,
     )

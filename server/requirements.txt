@@ -1,3 +1,4 @@
+gradio>=6.10.0
 openai>=1.75.0
 openenv-core[core]>=0.2.2
 pydantic>=2.12.5
