@@ -1,7 +1,7 @@
 """
 judge_engine.py — multi-dimensional LLM judge for the hackathon environment.
 
-All LLM calls use the OpenAI client against the fixed OpenRouter-compatible endpoint.
+All LLM calls use the OpenAI client against the injected OpenAI-compatible endpoint.
 """
 
 from __future__ import annotations
@@ -14,7 +14,13 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 from openai import OpenAI
 
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+def _runtime_api_base_url(api_base_url: Optional[str] = None) -> str:
+    return api_base_url or os.environ.get("API_BASE_URL", "")
+
+
+def _runtime_api_key(api_key: Optional[str] = None) -> str:
+    return api_key or os.environ.get("API_KEY", "")
 
 
 # ─────────────────────────────────────────────
@@ -115,7 +121,7 @@ class JudgeState(BaseModel):
 
 
 # ─────────────────────────────────────────────
-#  Helper: call OpenRouter
+#  Helper: call injected OpenAI-compatible endpoint
 # ─────────────────────────────────────────────
 
 JUDGE_SYSTEM = """You are an expert reinforcement-learning environment judge.
@@ -137,8 +143,8 @@ def _llm_call(api_base_url: str, api_key: str, model: str, user_prompt: str, sch
     """Call an OpenAI-compatible chat endpoint and return raw JSON text."""
     try:
         client = OpenAI(
-            base_url=api_base_url or OPENROUTER_BASE_URL,
-            api_key=api_key,
+            base_url=_runtime_api_base_url(api_base_url),
+            api_key=_runtime_api_key(api_key),
         )
         response = client.chat.completions.create(
             model=model,
@@ -604,8 +610,8 @@ def run_llm_judge(
         step_context=step_context,
         available_tools=available_tools,
         previous_actions=previous_actions,
-        api_base_url=api_base_url or OPENROUTER_BASE_URL,
-        api_key=api_key,
+        api_base_url=_runtime_api_base_url(api_base_url),
+        api_key=_runtime_api_key(api_key),
         model=model,
     )
     state = node_parse_action(state)

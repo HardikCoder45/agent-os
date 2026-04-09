@@ -11,7 +11,7 @@ MANDATORY STDOUT FORMAT:
 Required environment variables:
 - API_BASE_URL: The API endpoint for the LLM
 - MODEL_NAME: The model identifier to use for inference
-- HF_TOKEN: API key for authentication
+- API_KEY: API key for authentication
 """
 
 from __future__ import annotations
@@ -29,10 +29,9 @@ from hackathon_environment import HackathonAction, HackathonEnvironment
 from task_graders import grade_episode
 
 
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-API_BASE_URL = OPENROUTER_BASE_URL
+API_BASE_URL = os.environ["API_BASE_URL"] if "API_BASE_URL" in os.environ else os.environ.get("API_BASE_URL", "")
 MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
-HF_TOKEN = os.environ.get("HF_TOKEN", "")
+API_KEY = os.environ["API_KEY"] if "API_KEY" in os.environ else ""
 OUTPUT_DIR = Path("outputs")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -104,9 +103,9 @@ def _generate_reasoning(client: Optional[OpenAI], task: Dict[str, Any]) -> str:
 def run_episode(client: Optional[OpenAI], task_payload: Dict[str, Any]) -> Dict[str, Any]:
     env = HackathonEnvironment(
         api_base_url=API_BASE_URL,
-        api_key=HF_TOKEN,
+        api_key=API_KEY,
         judge_model=MODEL_NAME,
-        use_llm_judge=bool(HF_TOKEN),
+        use_llm_judge=bool(API_BASE_URL and API_KEY),
     )
 
     rewards: List[float] = []
@@ -151,7 +150,7 @@ def run_episode(client: Optional[OpenAI], task_payload: Dict[str, Any]) -> Dict[
 
 
 def main() -> None:
-    client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN) if HF_TOKEN else None
+    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY) if API_BASE_URL and API_KEY else None
 
     task_payloads = []
     for task in list_tasks():

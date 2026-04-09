@@ -18,7 +18,7 @@ Hackathon OpenEnv is a deployment-ready OpenEnv benchmark for strategic business
 - `reset()`, `step()`, and `state` now follow the installed OpenEnv interface directly.
 - The root Space URL returns `200` with a working control surface instead of a blank / 404 landing page.
 - Four benchmark tasks are exposed through `/tasks`, with deterministic graders and rewards in the `0.0` to `1.0` range.
-- The judge path supports OpenAI-compatible endpoints via `API_BASE_URL`, `MODEL_NAME`, and `HF_TOKEN`.
+- The judge path supports OpenAI-compatible endpoints via `API_BASE_URL`, `MODEL_NAME`, and `API_KEY`.
 - The repository includes both a root `Dockerfile` for Hugging Face Spaces and the expected root `inference.py`.
 
 ## Required Environment Variables
@@ -27,7 +27,7 @@ Before submitting, define these variables in the Space or runtime configuration:
 
 - `API_BASE_URL`: the OpenAI-compatible LLM endpoint.
 - `MODEL_NAME`: the model name used for inference and optional judging.
-- `HF_TOKEN`: the API key used by the OpenAI client.
+- `API_KEY`: the API key used by the OpenAI client.
 
 ## Benchmark Tasks
 
@@ -92,7 +92,7 @@ The script:
 - enumerates all benchmark tasks
 - emits strict `[START]`, `[STEP]`, and `[END]` structured logs
 - writes reproducible scores to `outputs/baseline_scores.json`
-- uses the OpenAI client when `API_BASE_URL`, `MODEL_NAME`, and `HF_TOKEN` are available
+- uses the OpenAI client when `API_BASE_URL`, `MODEL_NAME`, and `API_KEY` are available
 - falls back to a deterministic benchmark reasoning policy if the LLM is unavailable
 
 ## Docker
@@ -109,7 +109,7 @@ Run locally:
 docker run --rm -p 7860:7860 \
   -e API_BASE_URL="$API_BASE_URL" \
   -e MODEL_NAME="$MODEL_NAME" \
-  -e HF_TOKEN="$HF_TOKEN" \
+  -e API_KEY="$API_KEY" \
   hackathon-openenv
 ```
 

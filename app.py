@@ -4,7 +4,7 @@ app.py — Hackathon Agent Environment · Gradio UI
 Preserves original UI structure (colored agent header, scenario briefing,
 step question, J1 scoring panels, replay log, sub-agent console)
 while adding:
-  ✅ OpenRouter API key + custom/typed model in UI
+  ✅ API key + custom/typed model in UI
   ✅ LLM judge (multi-dimensional) OR manual judge — toggle
   ✅ Configurable score threshold gate
   ✅ NO "Required tool: X" hints anywhere
@@ -162,8 +162,9 @@ DEFAULT_MODELS = [
     "Custom (type below)"
 ]
 
-DEFAULT_API_BASE_URL = "https://openrouter.ai/api/v1"
+DEFAULT_API_BASE_URL = os.environ.get("API_BASE_URL", "")
 DEFAULT_MODEL_NAME = os.environ.get("MODEL_NAME", DEFAULT_MODELS[0])
+DEFAULT_API_KEY = os.environ.get("API_KEY", "")
 
 
 # ─────────────────────────────────────────────
@@ -1197,7 +1198,7 @@ with gr.Blocks(title="AGENT OS") as demo:
           <div class="hero-subtitle">
             A stronger multi-agent operating system for scenario execution, interactive LLM judging,
             specialist consultation, replay analysis, and OpenEnv-compatible evaluation. The OpenAI client
-            is fixed to the OpenRouter-compatible endpoint: <code>{DEFAULT_API_BASE_URL}</code>.
+            uses the injected proxy endpoint when <code>API_BASE_URL</code> and <code>API_KEY</code> are set.
           </div>
           <div class="hero-grid">
             <div class="hero-stat">
@@ -1220,10 +1221,11 @@ with gr.Blocks(title="AGENT OS") as demo:
     with gr.Row():
         with gr.Column(scale=2, min_width=220):
             api_key = gr.Textbox(
-                label="OpenRouter API Key",
+                label="API Key",
                 placeholder="sk-or-v1-...",
                 type="password",
-                info="Used through the OpenAI client with the fixed OpenRouter endpoint.",
+                value=DEFAULT_API_KEY,
+                info="Uses the injected API_KEY in validator and Space environments.",
             )
         with gr.Column(scale=4):
             with gr.Row():
@@ -1234,7 +1236,7 @@ with gr.Blocks(title="AGENT OS") as demo:
                     allow_custom_value=True,
                     interactive=True,
                     scale=4,
-                    info="Type any OpenRouter-compatible model ID directly if it is not listed.",
+                    info="Type any OpenAI-compatible model ID directly if it is not listed.",
                 )
                 judge_mode = gr.Radio(
                     choices=["🧩 Combined Judge", "🤖 LLM Judge", "🧮 Rubric Judge", "✍ Human Override"],

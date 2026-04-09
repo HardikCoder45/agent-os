@@ -83,7 +83,7 @@ class HackathonEnvironment(Environment[HackathonAction, HackathonObservation, Ha
             available_tools=list(self._tools().keys()),
             scenario_context=self._scenario_context(self._task),
             api_base_url=api_base_url or os.environ.get("API_BASE_URL"),
-            api_key=api_key or os.environ.get("HF_TOKEN"),
+            api_key=api_key or os.environ.get("API_KEY"),
             judge_model=judge_model or os.environ.get("MODEL_NAME"),
             use_llm_judge=use_llm_judge,
         )
@@ -188,7 +188,10 @@ class HackathonEnvironment(Environment[HackathonAction, HackathonObservation, Ha
             available_tools=list(self._tools().keys()),
             scenario_context=self._scenario_context(self._task),
             api_base_url=kwargs.get("api_base_url", self._state.api_base_url or os.environ.get("API_BASE_URL")),
-            api_key=kwargs.get("api_key", kwargs.get("hf_token", self._state.api_key or os.environ.get("HF_TOKEN"))),
+            api_key=kwargs.get(
+                "api_key",
+                kwargs.get("hf_token", self._state.api_key or os.environ.get("API_KEY")),
+            ),
             judge_model=kwargs.get("judge_model", kwargs.get("model_name", self._state.judge_model or os.environ.get("MODEL_NAME"))),
             use_llm_judge=bool(kwargs.get("use_llm_judge", self._state.use_llm_judge)),
         )
