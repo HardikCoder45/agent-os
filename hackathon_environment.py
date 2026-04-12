@@ -7,11 +7,11 @@ from uuid import uuid4
 
 from pydantic import Field
 
+from benchmark_engine import AgentOSSession
 from benchmark_tasks import BENCHMARK_NAME, get_task, list_tasks
 from openenv.core.env_server.interfaces import Environment
 from openenv.core.env_server.types import Action, EnvironmentMetadata, Observation, State
 from reward_engine import compute_reward
-from task_graders import grade_episode
 from tool_schemas import get_tools_for_role
 
 
@@ -29,12 +29,17 @@ class HackathonObservation(Observation):
     role: str = Field(..., description="Role expected to act")
     question: str = Field(..., description="Question the agent must answer")
     context: str = Field(..., description="Task context block")
-    step: int = Field(default=0, description="Current 1-based step index")
-    max_steps: int = Field(default=1, description="Maximum steps allowed")
+    phase_index: int = Field(default=0, description="Current 0-based phase index")
+    phase_count: int = Field(default=0, description="Total required phases")
+    step: int = Field(default=0, description="Current 1-based action attempt index")
+    max_steps: int = Field(default=0, description="Maximum number of action attempts")
     available_tools: List[str] = Field(default_factory=list, description="Role-specific tools")
-    scenario_context: Dict[str, Any] = Field(default_factory=dict, description="Scenario payload")
+    goal_progress: float = Field(default=0.0, description="0-1 progress toward the episode goal")
+    risk_flags: List[str] = Field(default_factory=list, description="Current risk flags")
+    events: List[str] = Field(default_factory=list, description="Recent state events")
+    visible_state_facts: List[str] = Field(default_factory=list, description="Visible scenario facts for the active step")
+    score_components: Dict[str, Any] = Field(default_factory=dict, description="Scoring components for the last action")
     reward_breakdown: Dict[str, Any] = Field(default_factory=dict, description="Detailed grader output")
-    counterfactual_tip: str = Field(default="", description="Reference strategy for the task")
 
 
 class HackathonState(State):
@@ -44,13 +49,26 @@ class HackathonState(State):
     role: str = ""
     scenario_id: str = ""
     scenario_title: str = ""
-    max_steps: int = 1
+    variant_id: str = "canonical"
+    phase_index: int = 0
+    phase_count: int = 0
+    max_steps: int = 0
     cumulative_reward: float = 0.0
     last_reward: float = 0.0
     done: bool = False
+    hard_failure: bool = False
+    goal_progress: float = 0.0
+    risk_flags: List[str] = Field(default_factory=list)
+    stakeholder_state: Dict[str, Any] = Field(default_factory=dict)
+    resource_state: Dict[str, Any] = Field(default_factory=dict)
+    locked_or_unlocked_paths: List[str] = Field(default_factory=list)
     action_history: List[Dict[str, Any]] = Field(default_factory=list)
+    score_ledger: List[float] = Field(default_factory=list)
+    failure_counts: Dict[str, int] = Field(default_factory=dict)
+    hint_mode_enabled: bool = False
+    events: List[str] = Field(default_factory=list)
     available_tools: List[str] = Field(default_factory=list)
-    scenario_context: Dict[str, Any] = Field(default_factory=dict)
+    visible_state_facts: List[str] = Field(default_factory=list)
     api_base_url: Optional[str] = None
     api_key: Optional[str] = None
     judge_model: Optional[str] = None
@@ -68,20 +86,12 @@ class HackathonEnvironment(Environment[HackathonAction, HackathonObservation, Ha
         api_key: Optional[str] = None,
         judge_model: Optional[str] = None,
         use_llm_judge: bool = False,
+        variant_id: str = "canonical",
     ):
         super().__init__()
         self._task = get_task(task_id)
-        self._state = HackathonState(
-            episode_id=str(uuid4()),
-            task_id=self._task.id,
-            task_name=self._task.name,
-            domain=self._task.domain,
-            role=self._task.role,
-            scenario_id=self._task.scenario_id,
-            scenario_title=self._task.scenario_title,
-            max_steps=self._task.max_steps,
-            available_tools=list(self._tools().keys()),
-            scenario_context=self._scenario_context(self._task),
+        self._session = AgentOSSession(self._task.contract, variant_id=variant_id)
+        self._state = self._make_state(
             api_base_url=api_base_url or os.environ.get("API_BASE_URL"),
             api_key=api_key or os.environ.get("API_KEY"),
             judge_model=judge_model or os.environ.get("MODEL_NAME"),
@@ -91,21 +101,51 @@ class HackathonEnvironment(Environment[HackathonAction, HackathonObservation, Ha
     def _tools(self) -> Dict[str, Any]:
         return get_tools_for_role(self._task.role, self._task.domain)
 
-    def _scenario_context(self, task) -> Dict[str, Any]:
-        return {
-            "benchmark": BENCHMARK_NAME,
-            "task_id": task.id,
-            "scenario_title": task.scenario_title,
-            "briefing": task.briefing,
-            "goal": task.goal,
-            "question": task.question,
-            "context": task.context,
-            "required_tool": task.required_tool,
-            "required_args_hints": task.required_args_hints,
-            "success_threshold": task.success_threshold,
-        }
+    def _make_state(
+        self,
+        *,
+        api_base_url: Optional[str],
+        api_key: Optional[str],
+        judge_model: Optional[str],
+        use_llm_judge: bool,
+    ) -> HackathonState:
+        snapshot = self._session.public_state()
+        return HackathonState(
+            episode_id=str(uuid4()),
+            task_id=self._task.id,
+            task_name=self._task.name,
+            domain=self._task.domain,
+            role=self._task.role,
+            scenario_id=self._task.scenario_id,
+            scenario_title=self._task.scenario_title,
+            variant_id=snapshot["variant_id"],
+            phase_index=snapshot["phase_index"],
+            phase_count=snapshot["phase_count"],
+            max_steps=snapshot["max_turns"],
+            cumulative_reward=sum(snapshot["score_ledger"]),
+            last_reward=snapshot["score_ledger"][-1] if snapshot["score_ledger"] else 0.0,
+            done=snapshot["done"],
+            hard_failure=False,
+            goal_progress=snapshot["goal_progress"],
+            risk_flags=list(snapshot["risk_flags"]),
+            stakeholder_state=dict(snapshot["stakeholder_state"]),
+            resource_state=dict(snapshot["resource_state"]),
+            locked_or_unlocked_paths=list(snapshot["locked_or_unlocked_paths"]),
+            action_history=list(snapshot["action_history"]),
+            score_ledger=list(snapshot["score_ledger"]),
+            failure_counts=dict(snapshot["failure_counts"]),
+            hint_mode_enabled=bool(snapshot["hint_mode_enabled"]),
+            events=list(snapshot["events"]),
+            available_tools=list(snapshot["available_tools"]),
+            visible_state_facts=list(self._session.current_visible_facts()),
+            api_base_url=api_base_url,
+            api_key=api_key,
+            judge_model=judge_model,
+            use_llm_judge=use_llm_judge,
+        )
 
     def _build_text(self, *, extra: str = "") -> str:
+        step_view = self._session.current_step_public_view() if not self._state.done else {}
         tools = ", ".join(f"`{name}`" for name in self._state.available_tools) or "(none)"
         lines = [
             f"# {self._task.scenario_title}",
@@ -113,48 +153,61 @@ class HackathonEnvironment(Environment[HackathonAction, HackathonObservation, Ha
             f"**Task:** `{self._task.id}`",
             f"**Benchmark:** `{BENCHMARK_NAME}`",
             f"**Domain / Role:** `{self._task.domain}` / `{self._task.role}`",
-            f"**Step:** {self._state.step_count + 1}/{self._state.max_steps}",
+            f"**Phase:** {self._state.phase_index + 1}/{self._state.phase_count}",
+            f"**Attempts:** {self._state.step_count + 1}/{self._state.max_steps}",
+            f"**Goal Progress:** {self._state.goal_progress:.2%}",
             "",
             f"**Goal:** {self._task.goal}",
             "",
-            f"**Question:** {self._task.question}",
+            f"**Question:** {step_view.get('step_question', 'Episode complete')}",
             "",
-            self._task.context,
+            step_view.get("step_context", self._task.contract.variants[self._state.variant_id].briefing),
             "",
             f"**Available Tools:** {tools}",
-            "",
-            f"**Cumulative Reward:** {self._state.cumulative_reward:.4f}",
         ]
+        if step_view.get("visible_state_facts"):
+            lines.extend(["", "**Visible Facts:**"])
+            lines.extend(f"- {fact}" for fact in step_view["visible_state_facts"])
+        lines.extend(["", f"**Cumulative Reward:** {self._state.cumulative_reward:.4f}"])
+        if self._state.risk_flags:
+            lines.extend(["", f"**Risk Flags:** {', '.join(self._state.risk_flags)}"])
         if extra:
             lines.extend(["", "---", extra])
         return "\n".join(lines)
 
     def _make_observation(self, *, reward: float, reward_breakdown: Dict[str, Any], done: bool) -> HackathonObservation:
+        step_view = self._session.current_step_public_view() if not done else {"step_question": "Episode complete", "step_context": ""}
         return HackathonObservation(
             text=self._build_text(
                 extra=(
-                    "Use one high-leverage action grounded in the scenario."
+                    "Take one high-leverage action grounded in the visible scenario facts."
                     if self._state.step_count == 0 and not reward_breakdown
-                    else f"Reward `{reward:.4f}` computed via `{reward_breakdown.get('method', 'deterministic_task_grader')}`."
+                    else f"Reward `{reward:.4f}` computed via `{reward_breakdown.get('method', 'stateful_checklist_grader')}`."
                 )
             ),
             task_id=self._task.id,
             task_name=self._task.name,
             domain=self._task.domain,
             role=self._task.role,
-            question=self._task.question,
-            context=self._task.context,
+            question=step_view.get("step_question", ""),
+            context=step_view.get("step_context", ""),
+            phase_index=self._state.phase_index,
+            phase_count=self._state.phase_count,
             step=self._state.step_count,
-            max_steps=self._task.max_steps,
+            max_steps=self._state.max_steps,
             available_tools=list(self._state.available_tools),
-            scenario_context=dict(self._state.scenario_context),
+            goal_progress=self._state.goal_progress,
+            risk_flags=list(self._state.risk_flags),
+            events=list(self._state.events[-5:]),
+            visible_state_facts=list(step_view.get("visible_state_facts", [])),
+            score_components=dict(reward_breakdown.get("score_components", {})),
             reward_breakdown=reward_breakdown,
-            counterfactual_tip=self._task.counterfactual_tip,
             reward=reward,
             done=done,
             metadata={
                 "task_id": self._task.id,
                 "scenario_id": self._task.scenario_id,
+                "variant_id": self._state.variant_id,
             },
         )
 
@@ -170,32 +223,16 @@ class HackathonEnvironment(Environment[HackathonAction, HackathonObservation, Ha
             role=kwargs.get("role"),
             seed=seed,
         )
-
-        self._state = HackathonState(
-            episode_id=episode_id or str(uuid4()),
-            step_count=0,
-            task_id=self._task.id,
-            task_name=self._task.name,
-            domain=self._task.domain,
-            role=self._task.role,
-            scenario_id=self._task.scenario_id,
-            scenario_title=self._task.scenario_title,
-            max_steps=self._task.max_steps,
-            cumulative_reward=0.0,
-            last_reward=0.0,
-            done=False,
-            action_history=[],
-            available_tools=list(self._tools().keys()),
-            scenario_context=self._scenario_context(self._task),
-            api_base_url=kwargs.get("api_base_url", self._state.api_base_url or os.environ.get("API_BASE_URL")),
-            api_key=kwargs.get(
-                "api_key",
-                kwargs.get("hf_token", self._state.api_key or os.environ.get("API_KEY")),
-            ),
-            judge_model=kwargs.get("judge_model", kwargs.get("model_name", self._state.judge_model or os.environ.get("MODEL_NAME"))),
+        variant_id = kwargs.get("variant_id", "canonical")
+        self._session = AgentOSSession(self._task.contract, variant_id=variant_id, seed=seed)
+        self._state = self._make_state(
+            api_base_url=kwargs.get("api_base_url", os.environ.get("API_BASE_URL")),
+            api_key=kwargs.get("api_key", os.environ.get("API_KEY")),
+            judge_model=kwargs.get("judge_model", kwargs.get("model_name", os.environ.get("MODEL_NAME"))),
             use_llm_judge=bool(kwargs.get("use_llm_judge", self._state.use_llm_judge)),
         )
-
+        self._state.episode_id = episode_id or str(uuid4())
+        self._state.step_count = 0
         return self._make_observation(reward=0.0, reward_breakdown={}, done=False)
 
     def step(
@@ -204,14 +241,21 @@ class HackathonEnvironment(Environment[HackathonAction, HackathonObservation, Ha
         timeout_s: Optional[float] = None,
         **kwargs: Any,
     ) -> HackathonObservation:
+        del timeout_s
         if self._state.done:
             return self._make_observation(
                 reward=self._state.last_reward,
-                reward_breakdown={"method": "episode_complete", "message": "Call reset() to start another task."},
+                reward_breakdown={
+                    "method": "episode_complete",
+                    "message": "Call reset() to start another task.",
+                    "episode_summary": {"final_episode_score": self._state.cumulative_reward},
+                },
                 done=True,
             )
 
         tools = self._tools()
+        step_view = self._session.current_step_public_view()
+        current_step = self._session.current_step_contract()
         reward, detail = compute_reward(
             agent_output=json.dumps(
                 {
@@ -225,12 +269,15 @@ class HackathonEnvironment(Environment[HackathonAction, HackathonObservation, Ha
             reasoning=action.reasoning,
             available_tools=list(tools.keys()),
             tool_registry=tools,
-            scenario=self._state.scenario_context,
+            scenario=self._session.public_task_payload(),
             step_context={
-                "step": self._state.step_count + 1,
-                "domain": self._task.domain,
-                "role": self._task.role,
-                "task_id": self._task.id,
+                "phase_index": self._state.phase_index,
+                "step_id": current_step.step_id,
+                "question": step_view["step_question"],
+                "context": step_view["step_context"],
+                "visible_facts": step_view["visible_state_facts"],
+                "failure_count": self._state.failure_counts.get(current_step.step_id, 0),
+                "turn_index": self._state.step_count,
             },
             previous_actions=self._state.action_history[-3:],
             task=self._task,
@@ -240,27 +287,39 @@ class HackathonEnvironment(Environment[HackathonAction, HackathonObservation, Ha
             use_llm_judge=bool(kwargs.get("use_llm_judge", self._state.use_llm_judge)),
         )
 
-        self._state.step_count += 1
-        self._state.last_reward = reward
-        self._state.cumulative_reward += reward
-        self._state.action_history.append(
-            {
-                "step": self._state.step_count,
-                "tool": action.tool,
-                "args": dict(action.args),
-                "reasoning": action.reasoning,
-                "reward": reward,
-                "detail": detail,
-            }
+        transition = self._session.apply_action_result(
+            tool=action.tool,
+            args=dict(action.args),
+            reasoning=action.reasoning,
+            detail=detail,
+            final_reward=reward,
+            llm_score=detail.get("llm_score"),
+            llm_confidence=(detail.get("llm_verdict") or {}).get("confidence") if detail.get("llm_verdict") else None,
         )
 
-        self._state.done = self._state.step_count >= self._task.max_steps or reward >= self._task.success_threshold
-        if self._state.done:
-            detail["episode_grade"] = grade_episode(
-                self._task,
-                [item["reward"] for item in self._state.action_history],
-                self._state.done,
-            )
+        state_snapshot = transition["state"]
+        self._state.step_count += 1
+        self._state.phase_index = state_snapshot["phase_index"]
+        self._state.phase_count = state_snapshot["phase_count"]
+        self._state.max_steps = state_snapshot["max_turns"]
+        self._state.last_reward = reward
+        self._state.cumulative_reward = sum(state_snapshot["score_ledger"])
+        self._state.done = transition["done"]
+        self._state.hard_failure = self._state.hard_failure or bool(detail.get("hard_failure"))
+        self._state.goal_progress = state_snapshot["goal_progress"]
+        self._state.risk_flags = list(state_snapshot["risk_flags"])
+        self._state.stakeholder_state = dict(state_snapshot["stakeholder_state"])
+        self._state.resource_state = dict(state_snapshot["resource_state"])
+        self._state.locked_or_unlocked_paths = list(state_snapshot["locked_or_unlocked_paths"])
+        self._state.action_history = list(state_snapshot["action_history"])
+        self._state.score_ledger = list(state_snapshot["score_ledger"])
+        self._state.failure_counts = dict(state_snapshot["failure_counts"])
+        self._state.hint_mode_enabled = bool(state_snapshot["hint_mode_enabled"])
+        self._state.events = list(state_snapshot["events"])
+        self._state.available_tools = list(state_snapshot["available_tools"])
+        self._state.visible_state_facts = list(self._session.current_visible_facts()) if not self._state.done else []
+        if self._state.done and transition.get("episode_summary"):
+            detail["episode_summary"] = transition["episode_summary"]
 
         return self._make_observation(
             reward=reward,
@@ -274,16 +333,16 @@ class HackathonEnvironment(Environment[HackathonAction, HackathonObservation, Ha
 
     def get_metadata(self) -> EnvironmentMetadata:
         return EnvironmentMetadata(
-            name="Hackathon OpenEnv",
+            name="AGENT OS",
             description=(
-                "OpenEnv benchmark for strategic business decision making with deterministic task graders, "
-                "typed action/observation/state models, and Hugging Face Space deployment support."
+                "Stateful OpenEnv benchmark for strategic business decision making with 12 canonical scenarios, "
+                "10-step operating cadences, deterministic checklist grading, and bounded LLM semantic judging."
             ),
-            version="1.0.0",
+            version="2.0.0",
             author="Hardik Arora",
-            documentation_url="https://huggingface.co/docs/hub/en/spaces-overview",
+            documentation_url="https://github.com/meta-pytorch/OpenEnv",
             readme_content=(
-                f"{BENCHMARK_NAME} exposes {len(list_tasks())} graded tasks with role-specific tools, "
-                "deterministic rewards, optional LLM judging, and a root-level baseline inference script."
+                f"{BENCHMARK_NAME} exposes {len(list_tasks())} canonical tasks, seeded stress variants, "
+                "strict typed tool validation, leak-free public observations, and a proxy-safe baseline agent."
             ),
         )

@@ -33,6 +33,7 @@ env/
 *.swo
 *~
 .git-credentials
+
 # OS
 .DS_Store
 Thumbs.db
@@ -48,6 +49,9 @@ Thumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
+.mypy_cache/
+.ruff_cache/
+.cache/
 
 # Gradio
 flagged/
@@ -55,3 +59,5 @@ flagged/
 # Generated artifacts
 outputs/
 inference_results.json
+__pycache__/
+*.egg-info/

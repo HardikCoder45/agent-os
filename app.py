@@ -296,14 +296,17 @@ def _replay_md(replay: List[Dict]) -> str:
     if not replay:
         return "_No actions yet._"
     lines = [
-        "| Step | Tool | Rubric Score | Words | Tier |",
-        "|------|------|--------------|-------|------|",
+        "| Turn | Phase | Tool | Final | Deterministic | Passed |",
+        "|------|-------|------|-------|---------------|--------|",
     ]
     for r in replay:
-        j1 = f"{r.get('j1', 0):.3f}"
-        rw = str(r.get("thinking_words", 0)) + "w"
-        tier = r.get("rubric_tier", "?")
-        lines.append(f"| {r['step']} | `{r['tool']}` | {j1} | {rw} | {tier} |")
+        final_score = f"{r.get('final_score', r.get('manual_score', 0)):.3f}"
+        deterministic = f"{r.get('manual_score', r.get('deterministic_score', 0)):.3f}"
+        passed = "yes" if r.get("passed_threshold", True) else "retry"
+        lines.append(
+            f"| {r.get('turn_index', r.get('step', '?'))} | {int(r.get('phase_index', 0)) + 1} | "
+            f"`{r.get('tool', '?')}` | {final_score} | {deterministic} | {passed} |"
+        )
     return "\n".join(lines)
 
 
@@ -319,11 +322,19 @@ def _progress_bar(step: int, total: int) -> str:
 def _step_panel(obs: Dict[str, Any], extra_note: str = "") -> str:
     step_idx = int(obs.get("step_index", 0))
     total = int(obs.get("total_steps", 0))
+    visible_facts = list(obs.get("visible_state_facts", []) or [])
+    risk_flags = list(obs.get("risk_flags", []) or [])
+    goal_progress = float(obs.get("goal_progress", obs.get("progress", 0.0)) or 0.0)
     panel = (
         f"### Step {step_idx + 1} / {total}\n\n"
         f"**{obs.get('step_question', '')}**\n\n"
-        f"_{obs.get('step_context', '')}_"
+        f"_{obs.get('step_context', '')}_\n\n"
+        f"**Goal Progress:** `{goal_progress:.1%}`"
     )
+    if visible_facts:
+        panel += "\n\n**Visible Facts:**\n" + "\n".join(f"- {fact}" for fact in visible_facts[:4])
+    if risk_flags:
+        panel += "\n\n**Risk Flags:**\n" + "\n".join(f"- {flag}" for flag in risk_flags[:4])
     if extra_note:
         panel += f"\n\n{extra_note}"
     return panel
@@ -346,29 +357,31 @@ def _hint_block(obs: Dict[str, Any], counterfactual: str, fail_count: int) -> st
 
 
 def _manual_feedback(manual_score: float, manual_breakdown: Dict[str, Any], tool_errors: List[str]) -> Tuple[str, List[str]]:
-    reasoning_score = float(manual_breakdown.get("reasoning_score", manual_score))
-    tool_arg_score = float(manual_breakdown.get("tool_arg_score", manual_score))
-    rubric_tier = manual_breakdown.get("rubric_tier", "unknown")
+    deterministic_score = float(manual_breakdown.get("deterministic_score", manual_score))
+    semantic_score = float(manual_breakdown.get("semantic_score", manual_score))
+    trajectory_score = float(manual_breakdown.get("trajectory_score", manual_score))
     tool_hints = list(manual_breakdown.get("tool_hints", []) or [])
+    failed_checks = list(manual_breakdown.get("failed_checks", []) or [])
 
     if manual_score >= 0.85:
-        feedback = "Rubric scoring sees a strong step: the tool choice and reasoning are aligned with the scenario."
+        feedback = "The deterministic checklist sees a strong step: the action is grounded, phase-appropriate, and operationally specific."
     elif manual_score >= 0.65:
-        feedback = "Rubric scoring sees a workable answer, but it still needs sharper scenario alignment or fuller arguments."
+        feedback = "The action is workable, but one or more checklist areas still need sharper scenario grounding or execution detail."
     elif manual_score >= 0.40:
-        feedback = "Rubric scoring sees partial progress only. The action is missing important step-specific detail."
+        feedback = "The action only partially moves the phase forward. Important facts, risks, or constraints are still missing."
     else:
-        feedback = "Rubric scoring sees a weak move for this step. The answer is not grounded enough in the scenario requirements."
+        feedback = "The action is weak for this phase. It is either under-specified, poorly grounded, or strategically misaligned."
 
     tips: List[str] = []
     if tool_errors:
         tips.extend(tool_errors[:2])
-    if tool_arg_score < 0.65:
+    if deterministic_score < 0.65:
         tips.extend(tool_hints[:2] or ["Tighten the tool arguments and cover the core required fields."])
-    if reasoning_score < 0.65:
+    if semantic_score < 0.65:
         tips.append("Make the reasoning more explicit about tradeoffs, risks, and success criteria.")
-    if rubric_tier == "poor":
-        tips.append("Re-anchor the answer to the exact question being asked on this step.")
+    if trajectory_score < 0.6:
+        tips.append("Show clearer forward motion from the prior attempt instead of repeating the same move.")
+    tips.extend(failed_checks[:2])
     return feedback, tips[:4]
 
 
@@ -412,13 +425,10 @@ def on_start(domain: str, role: str):
         scenario_md = (
             f"## 📋 {OBS.get('scenario_title', '')}\n\n"
             f"**Goal:** {OBS.get('scenario_goal', '')}\n\n"
-            f"{OBS.get('scenario_briefing', '')}"
+            f"{OBS.get('scenario_briefing', '')}\n\n"
+            f"**Progress:** `{float(OBS.get('goal_progress', 0.0)):.1%}`"
         )
-        step_md = (
-            f"### Step {step_idx + 1} / {total}\n\n"
-            f"**{OBS.get('step_question', '')}**\n\n"
-            f"_{OBS.get('step_context', '')}_"
-        )
+        step_md = _step_panel(OBS)
         guide = (
             _tool_arg_guide(role_tools.get(tool_names[0]))
             if tool_names
@@ -514,6 +524,7 @@ def on_step(
     next_step = result.get("next_step")
     tool_errors = result.get("tool_errors", [])
     counterfactual = result.get("counterfactual", "")
+    reward_breakdown = result.get("reward_breakdown", {})
 
     step_idx = int(obs_snapshot.get("step_index", 0)) + 1
     total = int(obs_snapshot.get("total_steps", 8))
@@ -526,17 +537,16 @@ def on_step(
             f"_Review the Replay Log below._"
         )
     elif next_step:
-        q = (
-            next_step.get("question", "")
-            if isinstance(next_step, dict)
-            else getattr(next_step, "question", "")
-        )
-        ctx = (
-            next_step.get("context", "")
-            if isinstance(next_step, dict)
-            else getattr(next_step, "context", "")
-        )
-        step_md = f"### Step {step_idx + 1} / {total}\n\n**{q}**\n\n_{ctx}_"
+        next_obs = {
+            "step_index": int(obs_snapshot.get("step_index", 0)) + 1,
+            "total_steps": total,
+            "step_question": next_step.get("step_question", next_step.get("question", "")),
+            "step_context": next_step.get("step_context", next_step.get("context", "")),
+            "visible_state_facts": next_step.get("visible_state_facts", []),
+            "goal_progress": result.get("reward_breakdown", {}).get("state_delta", {}).get("decision_quality", obs_snapshot.get("goal_progress", 0.0)),
+            "risk_flags": obs_snapshot.get("risk_flags", []),
+        }
+        step_md = _step_panel(next_obs)
     else:
         step_md = f"### Step {step_idx + 1} / {total}\n\n_Continuing…_"
 
@@ -583,31 +593,34 @@ def on_step(
     llm_requested = judge_mode in {"🤖 LLM Judge", "⚖ Hybrid", "🧩 Combined Judge"}
     if llm_requested and api_key.strip():
         try:
-            llm_verdict = run_llm_judge(
-                agent_output=action_str,
-                tool_registry=tool_registry_serializable,
-                scenario={
-                    "title": obs_snapshot.get("scenario_title", ""),
-                    "goal": obs_snapshot.get("scenario_goal", ""),
-                    "briefing": obs_snapshot.get("scenario_briefing", ""),
-                    "domain": getattr(ENV, "domain", ""),
-                    "role": role,
-                },
-                step_context={
-                    "step": step_idx,
-                    "total_steps": total,
-                    "step_id": obs_snapshot.get("step_id", ""),
-                    "question": obs_snapshot.get("step_question", ""),
-                    "context": obs_snapshot.get("step_context", ""),
-                    "rubric_score": rubric_score,
-                },
-                available_tools=list(role_tools.keys()),
-                previous_actions=ACTION_HISTORY[-5:],
-                api_base_url=DEFAULT_API_BASE_URL,
-                api_key=api_key.strip(),
-                model=judge_model,
-            )
-            if llm_verdict and not llm_verdict.instant_zero:
+            step_contract = env_snapshot.session.current_step_contract() if hasattr(env_snapshot, "session") else None
+            if step_contract is not None:
+                llm_verdict = run_llm_judge(
+                    reasoning=reasoning,
+                    tool_name=tool_name,
+                    args=args,
+                    step_contract=step_contract,
+                    scenario={
+                        "title": obs_snapshot.get("scenario_title", ""),
+                        "goal": obs_snapshot.get("scenario_goal", ""),
+                        "briefing": obs_snapshot.get("scenario_briefing", ""),
+                        "domain": getattr(ENV, "domain", ""),
+                        "role": role,
+                        "visible_facts": obs_snapshot.get("visible_state_facts", []),
+                    },
+                    step_context={
+                        "phase_index": int(obs_snapshot.get("step_index", 0)),
+                        "step_id": obs_snapshot.get("step_id", ""),
+                        "question": obs_snapshot.get("step_question", ""),
+                        "context": obs_snapshot.get("step_context", ""),
+                        "visible_facts": obs_snapshot.get("visible_state_facts", []),
+                        "failed_checks": reward_breakdown.get("failed_checks", []),
+                    },
+                    previous_actions=ACTION_HISTORY[-5:],
+                    api_base_url=DEFAULT_API_BASE_URL,
+                    api_key=api_key.strip(),
+                    model=judge_model,
+                )
                 llm_score = llm_verdict.total_score
         except Exception:
             llm_verdict = None
@@ -627,43 +640,29 @@ def on_step(
         mode_label = "Rubric Judge"
     elif judge_mode == "🤖 LLM Judge":
         if llm_verdict is not None:
-            if llm_verdict.instant_zero:
-                final_score = 0.0
-                llm_score = 0.0
-                feedback = llm_verdict.overall_feedback
-                tips = list(llm_verdict.instant_zero_reasons) + list(llm_verdict.improvement_tips)
-            else:
-                final_score = llm_verdict.total_score
-                llm_score = llm_verdict.total_score
-                feedback = llm_verdict.overall_feedback
-                tips = list(llm_verdict.improvement_tips)
+            final_score = llm_verdict.total_score
+            llm_score = llm_verdict.total_score
+            feedback = llm_verdict.overall_feedback
+            tips = list(llm_verdict.improvement_tips)
             mode_label = "LLM Judge"
         else:
             final_score = rubric_score
             feedback = "LLM judge was unavailable, so the rubric score was used as a fallback."
             mode_label = "LLM Judge (rubric fallback)"
     else:
-        if llm_verdict is not None and llm_verdict.instant_zero:
-            final_score = 0.0
-            llm_score = 0.0
+        final_score, blend_detail = blend_scores(
+            rubric_score,
+            llm_score,
+            llm_confidence=(llm_verdict.confidence if llm_verdict is not None else None),
+            gate_multiplier=float(reward_breakdown.get("gate_multiplier", 1.0)),
+        )
+        if llm_verdict is not None and llm_score is not None:
             feedback = llm_verdict.overall_feedback
-            tips = list(llm_verdict.instant_zero_reasons) + list(llm_verdict.improvement_tips) + list(rubric_tips)
-            blend_detail = {
-                "manual_weight": 0.55,
-                "llm_weight": 0.45,
-                "agreement_adjustment": 0.0,
-                "agreement_gap": 1.0,
-                "method": "instant_zero",
-            }
+            tips = list(dict.fromkeys(list(rubric_tips) + list(llm_verdict.improvement_tips)))
+            mode_label = "Combined Judge"
         else:
-            final_score, blend_detail = blend_scores(rubric_score, llm_score)
-            if llm_verdict is not None and llm_score is not None:
-                feedback = llm_verdict.overall_feedback
-                tips = list(dict.fromkeys(list(rubric_tips) + list(llm_verdict.improvement_tips)))
-                mode_label = "Combined Judge"
-            else:
-                feedback = "Combined mode is using the rubric score because the LLM judge is unavailable."
-                mode_label = "Combined Judge (rubric fallback)"
+            feedback = "Combined mode is using the deterministic checklist score because the LLM judge is unavailable."
+            mode_label = "Combined Judge (rubric fallback)"
 
     verdict_md = _render_score_card(
         final_score,
@@ -840,13 +839,10 @@ def on_reset(domain: str, role: str):
         scenario_md = (
             f"## 📋 {OBS.get('scenario_title', '')}\n\n"
             f"**Goal:** {OBS.get('scenario_goal', '')}\n\n"
-            f"{OBS.get('scenario_briefing', '')}"
+            f"{OBS.get('scenario_briefing', '')}\n\n"
+            f"**Progress:** `{float(OBS.get('goal_progress', 0.0)):.1%}`"
         )
-        step_md = (
-            f"### Step {step_idx + 1} / {total}\n\n"
-            f"**{OBS.get('step_question', '')}**\n\n"
-            f"_{OBS.get('step_context', '')}_"
-        )
+        step_md = _step_panel(OBS)
         guide = (
             _tool_arg_guide(role_tools.get(tool_names[0]))
             if tool_names
@@ -889,14 +885,21 @@ def on_get_state():
     try:
         state = ENV.get_state() if hasattr(ENV, "get_state") else OBS
         if isinstance(state, dict):
-            lines = ["### 🔍 Current Environment State", ""]
-            for k, v in state.items():
-                if k in ("j1_history", "cross_agent_log"):
-                    continue
-                if isinstance(v, (dict, list)):
-                    lines.append(f"**{k}:**\n```json\n{json.dumps(v, indent=2)}\n```")
-                else:
-                    lines.append(f"**{k}:** {v}")
+            lines = [
+                "### 🔍 Current Environment State",
+                "",
+                f"**Scenario:** {state.get('scenario_title', state.get('task_id', ''))}",
+                f"**Goal Progress:** `{float(state.get('goal_progress', 0.0)):.1%}`",
+                f"**Phase / Turns:** `{int(state.get('phase_index', 0)) + 1}/{state.get('phase_count', 0)}` phases, `{state.get('turn_index', 0)}/{state.get('max_turns', 0)}` turns",
+            ]
+            if state.get("risk_flags"):
+                lines.append("\n**Risk Flags:**\n" + "\n".join(f"- {flag}" for flag in state["risk_flags"]))
+            if state.get("events"):
+                lines.append("\n**Recent Events:**\n" + "\n".join(f"- {item}" for item in state["events"][-5:]))
+            for k in ("stakeholder_state", "resource_state", "failure_counts", "score_ledger"):
+                v = state.get(k)
+                if v:
+                    lines.append(f"\n**{k}:**\n```json\n{json.dumps(v, indent=2)}\n```")
             return "\n".join(lines)
         return f"```\n{state}\n```"
     except Exception as e:

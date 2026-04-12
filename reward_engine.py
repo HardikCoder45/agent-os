@@ -1,60 +1,19 @@
-"""
-reward_engine.py — Unified reward engine integrating:
-  1. Rule-based J1 scoring (fast, deterministic)
-  2. LLM multi-dimensional judge via judge_engine.py (deep, semantic)
-  3. Final combined reward ∈ [0, 1]
-
-Design principle: J1 catches objective violations instantly;
-LLM judge provides rich semantic evaluation that J1 cannot.
-"""
-
 from __future__ import annotations
 
+import json
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-from judge_engine import run_llm_judge, FinalVerdict
-from task_graders import grade_task_action
-from tool_schemas import TOOL_REGISTRY, validate_args
+from benchmark_engine import StepContract
+from judge_engine import ChecklistJudgeVerdict, run_llm_judge
+from tool_schemas import ToolSchema, validate_args
 
-# ──────────────────────────────────────────────
-#  J1: Fast rule-based scorer
-# ──────────────────────────────────────────────
 
-REASONING_KEYWORDS = [
-    "because", "therefore", "first", "then", "next", "since",
-    "given", "as a result", "consequently", "this means", "in order to",
-    "the goal is", "i need to", "i should", "this will", "so that",
-]
-
-FORMAT_KEYWORDS = ["tool", "args", "reasoning"]
-
-PENALTY_PATTERNS = [
-    (r"\b(test|dummy|placeholder|todo|fixme|pass|null)\b", -0.10, "Placeholder/stub language"),
-    (r"(.)\1{6,}", -0.08, "Repetitive characters"),
-]
-
-BONUS_PATTERNS = [
-    (r"\b(icp|ideal customer|segment|persona|revenue|conversion|churn|ltv|cac)\b", 0.03, "Business domain awareness"),
-    (r"\b(risk|compliance|legal|regulatory|gdpr|soc2)\b", 0.03, "Risk/compliance awareness"),
-    (r"\b(kpi|metric|benchmark|baseline|measurement)\b", 0.02, "Metrics awareness"),
-]
-
-PLACEHOLDER_PATTERN = re.compile(r"\b(test|dummy|placeholder|todo|fixme|pass|null)\b", re.IGNORECASE)
-STRATEGIC_SIGNAL_WORDS = (
-    "tradeoff",
-    "risk",
-    "metric",
-    "timeline",
-    "success",
-    "goal",
-    "stakeholder",
-    "runway",
-    "dilution",
-    "retention",
-    "governance",
-    "budget",
-)
+PLACEHOLDER_PATTERN = re.compile(r"\b(test|dummy|placeholder|todo|fixme|pass|null|tbd)\b", re.IGNORECASE)
+TRADEOFF_TOKENS = ("tradeoff", "however", "while", "instead", "but", "sacrifice", "not prioritizing")
+RISK_TOKENS = ("risk", "downside", "mitigate", "protect", "safe", "rollback", "monitor")
+STRATEGY_TOKENS = ("goal", "metric", "target", "timeline", "success", "within", "weeks", "days")
+HISTORY_TOKENS = ("next", "now", "since", "after", "previous", "earlier", "update", "checkpoint")
 
 
 def _clip(score: float) -> float:
@@ -94,120 +53,372 @@ def _semantic_match(actual: Any, expected: Any) -> float:
     return 1.0 if actual == expected else 0.0
 
 
-def blend_scores(manual_score: float, llm_score: Optional[float]) -> Tuple[float, Dict[str, Any]]:
-    manual_score = _clip(manual_score)
-    if llm_score is None:
-        return manual_score, {
-            "manual_weight": 1.0,
-            "llm_weight": 0.0,
-            "agreement_adjustment": 0.0,
-            "agreement_gap": None,
-            "method": "manual_only",
+def _contains_any(text: str, tokens: tuple[str, ...] | list[str]) -> float:
+    lowered = text.lower()
+    hits = sum(1 for token in tokens if token in lowered)
+    if hits <= 0:
+        return 0.0
+    if hits == 1:
+        return 0.55
+    if hits == 2:
+        return 0.8
+    return 1.0
+
+
+def _arg_coverage(args: Dict[str, Any], step_contract: StepContract) -> float:
+    required = list(step_contract.required_args_hints.keys())
+    if not required:
+        return 1.0
+    present = sum(1 for key in required if key in args and args.get(key) not in (None, "", []))
+    return _clip(present / len(required))
+
+
+def _fact_grounding_score(reasoning: str, args: Dict[str, Any], step_contract: StepContract, visible_facts: List[str]) -> float:
+    combined = f"{reasoning} {json.dumps(args, sort_keys=True)}".lower()
+    target_tokens = list(dict.fromkeys(step_contract.required_fact_tokens + [token for fact in visible_facts for token in _tokens(fact)]))
+    target_tokens = [token for token in target_tokens if len(token) >= 3][:12]
+    if not target_tokens:
+        return 0.5
+    hits = sum(1 for token in target_tokens if token in combined)
+    return _clip(hits / len(target_tokens))
+
+
+def _state_delta_score(reasoning: str, args: Dict[str, Any], step_contract: StepContract) -> Tuple[float, Dict[str, Any]]:
+    combined = f"{reasoning} {json.dumps(args, sort_keys=True)}".lower()
+    scored = {}
+    total = 0.0
+    weight_total = 0.0
+    for delta in step_contract.expected_state_deltas:
+        token_hits = sum(1 for token in delta.tokens if token in combined)
+        score = 1.0 if token_hits >= 2 else 0.5 if token_hits == 1 else 0.0
+        scored[delta.key] = score
+        total += score * delta.weight
+        weight_total += delta.weight
+    return (_clip(total / weight_total) if weight_total else 0.0), scored
+
+
+def _stakeholder_score(reasoning: str, step_contract: StepContract) -> float:
+    if not step_contract.mandatory_stakeholders:
+        return 0.8
+    lowered = reasoning.lower()
+    hits = sum(1 for stakeholder in step_contract.mandatory_stakeholders if stakeholder in lowered)
+    return _clip(hits / len(step_contract.mandatory_stakeholders))
+
+
+def _trajectory_score(reasoning: str, tool_name: str, args: Dict[str, Any], previous_actions: List[Dict[str, Any]]) -> Tuple[float, List[str]]:
+    if not previous_actions:
+        return 0.85, []
+    notes: List[str] = []
+    last = previous_actions[-1]
+    repeated = last.get("tool") == tool_name and last.get("args") == args
+    repetition_score = 0.0 if repeated else 1.0
+    if repeated:
+        notes.append("Repeated the same tool and arguments without new evidence.")
+    history_awareness = _contains_any(reasoning, HISTORY_TOKENS)
+    novelty = 0.4 if repeated else 0.9
+    score = _clip(0.5 * repetition_score + 0.25 * history_awareness + 0.25 * novelty)
+    return score, notes
+
+
+def _catastrophic_risk_flags(reasoning: str, args: Dict[str, Any], step_contract: StepContract) -> tuple[bool, List[str], float]:
+    combined = f"{reasoning} {json.dumps(args, sort_keys=True)}".lower()
+    risk_flags: List[str] = []
+    gate = 1.0
+    for risk_rule in step_contract.risk_rules:
+        for pattern in risk_rule.catastrophic_patterns:
+            if pattern and pattern in combined:
+                risk_flags.append(risk_rule.rule_id)
+                return True, risk_flags, 0.0
+        caution_hits = [pattern for pattern in risk_rule.caution_patterns if pattern and pattern in combined]
+        if caution_hits:
+            gate = min(gate, max(0.0, 1.0 - risk_rule.penalty))
+            risk_flags.append(risk_rule.rule_id)
+    return False, risk_flags, gate
+
+
+def _tips_from_failures(
+    *,
+    arg_errors: List[str],
+    failed_checks: List[str],
+    hallucinated_args: List[str],
+    step_contract: StepContract,
+    fact_grounding: float,
+    semantic_score: float,
+) -> List[str]:
+    tips: List[str] = []
+    tips.extend(arg_errors[:2])
+    if hallucinated_args:
+        tips.append(f"Remove unsupported arguments: {', '.join(hallucinated_args[:3])}.")
+    if fact_grounding < 0.45:
+        tips.append("Reference the live scenario numbers, constraints, and visible facts more explicitly.")
+    if semantic_score < 0.55:
+        tips.append("Name the tradeoff, the downside risk, and the measurable success target in the reasoning.")
+    if not tips:
+        tips.extend(step_contract.hint_templates[:3])
+    else:
+        tips.extend(step_contract.hint_templates[: max(0, 3 - len(tips))])
+    tips.extend(failed_checks[:2])
+    return list(dict.fromkeys(tips))[:4]
+
+
+def deterministic_program_score(
+    *,
+    tool_name: str,
+    args: Dict[str, Any],
+    reasoning: str,
+    step_contract: StepContract,
+    available_tools: List[str],
+    tool_schema: Optional[ToolSchema],
+    visible_facts: List[str],
+    previous_actions: List[Dict[str, Any]],
+    failure_count: int = 0,
+) -> Dict[str, Any]:
+    gate_multiplier = 1.0
+    failed_checks: List[str] = []
+    risk_flags: List[str] = []
+    hard_failure = False
+
+    if not tool_name or tool_name not in available_tools:
+        return {
+            "deterministic_score": 0.0,
+            "semantic_score": 0.0,
+            "trajectory_score": 0.0,
+            "manual_score": 0.0,
+            "gate_multiplier": 0.0,
+            "arg_errors": [f"Tool '{tool_name}' is not available for this role."],
+            "hallucinated_args": [],
+            "failed_checks": ["Choose a valid tool from the visible tool list."],
+            "risk_flags": ["invalid_tool"],
+            "hard_failure": False,
+            "tips": step_contract.hint_templates[:3],
+            "passed_threshold": False,
+            "state_delta": {"blocked_phase": step_contract.phase_name},
+            "score_components": {
+                "tool_alignment": 0.0,
+                "arg_coverage": 0.0,
+                "arg_quality": 0.0,
+                "fact_grounding": 0.0,
+                "state_delta": 0.0,
+                "stakeholder_awareness": 0.0,
+            },
         }
 
-    llm_score = _clip(llm_score)
-    gap = abs(manual_score - llm_score)
-    agreement_adjustment = 0.0
-    if gap <= 0.10:
-        agreement_adjustment = 0.03
-    elif gap >= 0.35:
-        agreement_adjustment = -0.04
-    elif gap >= 0.22:
-        agreement_adjustment = -0.02
+    tool_alignment = 1.0 if tool_name == step_contract.required_tool else 0.05
+    if tool_name != step_contract.required_tool:
+        gate_multiplier = min(gate_multiplier, 0.25)
+        failed_checks.append("Selected a lower-leverage tool than the benchmark expects for this phase.")
 
-    final = _clip((manual_score * 0.55) + (llm_score * 0.45) + agreement_adjustment)
-    return final, {
-        "manual_weight": 0.55,
-        "llm_weight": 0.45,
-        "agreement_adjustment": agreement_adjustment,
-        "agreement_gap": _clip(gap),
-        "method": "manual_llm_blend",
+    if tool_schema is None:
+        arg_valid, arg_errors, arg_quality, normalized_args, hallucinated_args = False, [f"No schema found for `{tool_name}`."], 0.0, {}, []
+    else:
+        arg_valid, arg_errors, arg_quality, normalized_args, hallucinated_args = validate_args(tool_schema, args)
+
+    if hallucinated_args:
+        gate_multiplier = min(gate_multiplier, 0.5)
+        failed_checks.append("Passed unsupported arguments.")
+
+    arg_coverage = _arg_coverage(normalized_args if normalized_args else args, step_contract)
+    if arg_coverage < 1.0:
+        gate_multiplier = min(gate_multiplier, 0.5)
+        failed_checks.append("Did not cover the required argument set.")
+
+    reasoning_text = reasoning.strip()
+    if len(reasoning_text.split()) < 8:
+        gate_multiplier = min(gate_multiplier, 0.5)
+        failed_checks.append("Reasoning is too short for a high-stakes step.")
+
+    placeholder_language = bool(PLACEHOLDER_PATTERN.search(reasoning_text)) or bool(
+        PLACEHOLDER_PATTERN.search(json.dumps(args, sort_keys=True))
+    )
+    if placeholder_language:
+        gate_multiplier = min(gate_multiplier, 0.35)
+        failed_checks.append("Placeholder language is not acceptable in the benchmark.")
+
+    catastrophic, catastrophic_flags, risk_gate = _catastrophic_risk_flags(reasoning_text, args, step_contract)
+    if catastrophic:
+        gate_multiplier = 0.0
+        hard_failure = True
+        risk_flags.extend(catastrophic_flags)
+        failed_checks.append("Triggered a catastrophic safety or governance pattern.")
+    else:
+        gate_multiplier = min(gate_multiplier, risk_gate)
+        risk_flags.extend(catastrophic_flags)
+
+    fact_grounding = _fact_grounding_score(reasoning_text, normalized_args if normalized_args else args, step_contract, visible_facts)
+    if fact_grounding < 0.35:
+        failed_checks.append("The reasoning is not grounded enough in the current scenario facts.")
+
+    state_delta_score, state_delta = _state_delta_score(reasoning_text, normalized_args if normalized_args else args, step_contract)
+    stakeholder_awareness = _stakeholder_score(reasoning_text, step_contract)
+
+    optimal_alignment_components = [
+        _semantic_match((normalized_args if normalized_args else args).get(key), expected)
+        for key, expected in step_contract.optimal_args.items()
+    ]
+    optimal_alignment = _clip(
+        sum(optimal_alignment_components) / max(len(optimal_alignment_components), 1)
+    )
+
+    deterministic_score = _clip(
+        tool_alignment * 0.32
+        + ((arg_quality * 0.65) + (arg_coverage * 0.35)) * 0.26
+        + fact_grounding * 0.16
+        + state_delta_score * 0.14
+        + stakeholder_awareness * 0.07
+        + optimal_alignment * 0.05
+    )
+
+    tradeoff_score = _contains_any(reasoning_text, TRADEOFF_TOKENS)
+    risk_score = _contains_any(reasoning_text, RISK_TOKENS)
+    strategy_score = _contains_any(reasoning_text, STRATEGY_TOKENS)
+    semantic_score = _clip(
+        tradeoff_score * 0.3
+        + stakeholder_awareness * 0.25
+        + strategy_score * 0.25
+        + risk_score * 0.2
+    )
+    if semantic_score < 0.5:
+        failed_checks.append("The answer needs clearer tradeoffs, stakeholders, and risk framing.")
+
+    trajectory_score, trajectory_notes = _trajectory_score(reasoning_text, tool_name, normalized_args if normalized_args else args, previous_actions)
+    failed_checks.extend(trajectory_notes)
+
+    manual_score = _clip(
+        gate_multiplier
+        * (
+            0.70 * deterministic_score
+            + 0.20 * semantic_score
+            + 0.10 * trajectory_score
+        )
+    )
+    if failure_count >= 2 and manual_score < step_contract.pass_threshold:
+        manual_score = min(manual_score, 0.4)
+        failed_checks.append("Repeated low-quality retries are capped until the strategy materially changes.")
+
+    tips = _tips_from_failures(
+        arg_errors=arg_errors,
+        failed_checks=failed_checks,
+        hallucinated_args=hallucinated_args,
+        step_contract=step_contract,
+        fact_grounding=fact_grounding,
+        semantic_score=semantic_score,
+    )
+
+    passed_threshold = manual_score >= step_contract.pass_threshold and not hard_failure
+    visible_state_delta = {
+        "last_tool": tool_name,
+        "phase_name": step_contract.phase_name,
+        "decision_quality": round(manual_score, 4),
+        "stakeholder_awareness": round(stakeholder_awareness, 4),
+    }
+    if passed_threshold:
+        visible_state_delta["phase_cleared"] = step_contract.phase_name
+    else:
+        visible_state_delta["blocked_phase"] = step_contract.phase_name
+
+    return {
+        "deterministic_score": deterministic_score,
+        "semantic_score": semantic_score,
+        "trajectory_score": trajectory_score,
+        "manual_score": manual_score,
+        "gate_multiplier": gate_multiplier,
+        "arg_errors": arg_errors,
+        "hallucinated_args": hallucinated_args,
+        "failed_checks": list(dict.fromkeys(failed_checks)),
+        "risk_flags": list(dict.fromkeys(risk_flags)),
+        "hard_failure": hard_failure,
+        "tips": tips,
+        "passed_threshold": passed_threshold,
+        "state_delta": visible_state_delta,
+        "score_components": {
+            "tool_alignment": round(tool_alignment, 4),
+            "arg_coverage": round(arg_coverage, 4),
+            "arg_quality": round(arg_quality, 4),
+            "fact_grounding": round(fact_grounding, 4),
+            "state_delta": round(state_delta_score, 4),
+            "stakeholder_awareness": round(stakeholder_awareness, 4),
+            "optimal_alignment": round(optimal_alignment, 4),
+            "tradeoff_awareness": round(tradeoff_score, 4),
+            "risk_awareness": round(risk_score, 4),
+            "strategy_awareness": round(strategy_score, 4),
+        },
+        "state_delta_components": state_delta,
     }
 
 
-def j1_score(
-    agent_output: str,
-    tool_name: str,
-    args: Dict,
-    available_tools: List[str],
-    rubric: Optional[Dict] = None,
-) -> Tuple[float, List[str]]:
-    """
-    Fast J1 rule-based scoring.
-    Returns (score ∈ [0, 1], list of reasons).
-    """
-    score = 0.5  # baseline
-    reasons = []
+def blend_scores(
+    deterministic_score: float,
+    llm_score: Optional[float],
+    *,
+    llm_confidence: Optional[float] = None,
+    gate_multiplier: float = 1.0,
+) -> Tuple[float, Dict[str, Any]]:
+    deterministic_score = _clip(deterministic_score)
+    if gate_multiplier == 0.0:
+        return 0.0, {
+            "manual_weight": 1.0,
+            "llm_weight": 0.0,
+            "agreement_gap": None,
+            "agreement_adjustment": 0.0,
+            "method": "hard_gate_zero",
+            "llm_confidence": llm_confidence,
+        }
 
-    # ─ Tool validity (hard gate) ─
-    if not tool_name:
-        return 0.0, ["No tool called"]
-    if available_tools and tool_name not in available_tools:
-        return 0.0, [f"Tool '{tool_name}' not in available tools"]
+    if llm_score is None:
+        return deterministic_score, {
+            "manual_weight": 1.0,
+            "llm_weight": 0.0,
+            "agreement_gap": None,
+            "agreement_adjustment": 0.0,
+            "method": "manual_only",
+            "llm_confidence": llm_confidence,
+        }
 
-    # ─ Args completeness ─
-    if not args:
-        score -= 0.15
-        reasons.append("Empty args")
-    elif len(args) >= 3:
-        score += 0.05
-        reasons.append("Rich arg set")
+    llm_score = _clip(llm_score)
+    confidence = llm_confidence if llm_confidence is not None else 0.75
+    manual_weight = 0.8
+    llm_weight = 0.2
+    if confidence < 0.60:
+        manual_weight, llm_weight = 0.95, 0.05
 
-    # ─ Reasoning quality ─
-    if not agent_output or len(agent_output.strip()) < 20:
-        score -= 0.20
-        reasons.append("No/minimal reasoning")
-    else:
-        kw_count = sum(1 for kw in REASONING_KEYWORDS if kw in agent_output.lower())
-        if kw_count == 0:
-            score -= 0.10
-            reasons.append("No reasoning connectors")
-        elif kw_count >= 3:
-            score += 0.10
-            reasons.append(f"Strong reasoning ({kw_count} connectors)")
-        elif kw_count >= 1:
-            score += 0.04
-            reasons.append(f"Basic reasoning ({kw_count} connectors)")
+    if deterministic_score < 0.20:
+        blended = min(0.30, deterministic_score * manual_weight + llm_score * llm_weight)
+        return _clip(blended), {
+            "manual_weight": manual_weight,
+            "llm_weight": llm_weight,
+            "agreement_gap": _clip(abs(deterministic_score - llm_score)),
+            "agreement_adjustment": 0.0,
+            "method": "low_manual_cap",
+            "llm_confidence": confidence,
+        }
 
-    # ─ Format compliance ─
-    fmt_hits = sum(1 for kw in FORMAT_KEYWORDS if kw in agent_output.lower())
-    if fmt_hits < 2:
-        score -= 0.05
-        reasons.append("Missing format keywords")
+    agreement_gap = abs(deterministic_score - llm_score)
+    agreement_adjustment = 0.0
+    if agreement_gap <= 0.10:
+        agreement_adjustment = 0.02
+    elif agreement_gap >= 0.35:
+        llm_weight *= 0.5
+        manual_weight = 1.0 - llm_weight
+        agreement_adjustment = -0.02
 
-    # ─ Penalty patterns ─
-    for pattern, penalty, label in PENALTY_PATTERNS:
-        if re.search(pattern, agent_output, re.IGNORECASE):
-            score += penalty
-            reasons.append(f"Penalty: {label}")
+    blended = deterministic_score * manual_weight + llm_score * llm_weight + agreement_adjustment
+    return _clip(blended), {
+        "manual_weight": round(manual_weight, 4),
+        "llm_weight": round(llm_weight, 4),
+        "agreement_gap": _clip(agreement_gap),
+        "agreement_adjustment": agreement_adjustment,
+        "method": "manual_llm_blend",
+        "llm_confidence": confidence,
+    }
 
-    # ─ Bonus patterns ─
-    for pattern, bonus, label in BONUS_PATTERNS:
-        if re.search(pattern, agent_output, re.IGNORECASE):
-            score += bonus
-            reasons.append(f"Bonus: {label}")
-
-    # ─ Rubric check ─
-    if rubric:
-        for criterion, weight in rubric.items():
-            if criterion.lower() in agent_output.lower():
-                score += weight * 0.1
-                reasons.append(f"Rubric match: {criterion}")
-
-    return round(max(0.0, min(1.0, score)), 4), reasons
-
-
-# ──────────────────────────────────────────────
-#  Combined reward
-# ──────────────────────────────────────────────
 
 def compute_reward(
     agent_output: str,
     tool_name: str,
-    args: Dict,
+    args: Dict[str, Any],
     reasoning: str,
     available_tools: List[str],
-    tool_registry: Dict[str, Any],
+    tool_registry: Dict[str, ToolSchema],
     scenario: Dict[str, Any],
     step_context: Dict[str, Any],
     previous_actions: List[Dict],
@@ -215,324 +426,82 @@ def compute_reward(
     rubric: Optional[Dict] = None,
     api_key: Optional[str] = None,
     api_base_url: Optional[str] = None,
-    judge_model: str = "anthropic/claude-3.5-sonnet",
+    judge_model: str = "openai/gpt-4.1-mini",
     use_llm_judge: bool = True,
 ) -> Tuple[float, Dict[str, Any]]:
-    """
-    Compute unified reward combining J1 and optional LLM judge.
+    del agent_output, rubric
+    if task is None or not hasattr(task, "contract"):
+        raise ValueError("compute_reward now requires a benchmark task with an episode contract.")
 
-    Returns:
-      (final_reward ∈ [0, 1], detail_dict)
-    """
-    task_grade: Optional[Dict[str, Any]] = None
-    if task is not None:
-        task_grade = grade_task_action(
-            task,
+    phase_index = int(step_context.get("phase_index", step_context.get("step", 1) - 1))
+    phase_index = max(0, min(phase_index, len(task.contract.steps) - 1))
+    step_contract: StepContract = task.contract.steps[phase_index]
+    visible_facts = list(step_context.get("visible_facts", []) or [])
+    failure_count = int(step_context.get("failure_count", 0))
+    tool_schema = tool_registry.get(tool_name)
+
+    deterministic_detail = deterministic_program_score(
+        tool_name=tool_name,
+        args=args,
+        reasoning=reasoning,
+        step_contract=step_contract,
+        available_tools=available_tools,
+        tool_schema=tool_schema,
+        visible_facts=visible_facts,
+        previous_actions=previous_actions,
+        failure_count=failure_count,
+    )
+
+    manual_score = float(deterministic_detail["manual_score"])
+    llm_score: Optional[float] = None
+    llm_verdict: Optional[ChecklistJudgeVerdict] = None
+    if use_llm_judge and api_key and api_base_url and deterministic_detail["gate_multiplier"] > 0.0:
+        llm_verdict = run_llm_judge(
+            reasoning=reasoning,
             tool_name=tool_name,
             args=args,
-            reasoning=reasoning,
-            available_tools=available_tools,
-            tool_schema=tool_registry.get(tool_name),
+            step_contract=step_contract,
+            scenario=scenario,
+            step_context=step_context,
+            previous_actions=previous_actions,
+            api_key=api_key,
+            api_base_url=api_base_url,
+            model=judge_model,
         )
-        base_score = task_grade["final_reward"]
-        j1 = base_score
-        j1_reasons = task_grade.get("notes", []) + task_grade.get("errors", [])
-    else:
-        j1, j1_reasons = j1_score(agent_output, tool_name, args, available_tools, rubric)
-        base_score = j1
+        if llm_verdict is not None:
+            llm_score = llm_verdict.semantic_score
 
-    # Hard gate: J1 zero means instant zero overall
-    if base_score == 0.0:
-        return 0.0, {
-            "manual_score": 0.0,
-            "manual_reasons": j1_reasons,
-            "deterministic_grade": task_grade,
-            "llm_verdict": None,
-            "llm_score": None,
-            "blend_detail": {
-                "manual_weight": 1.0,
-                "llm_weight": 0.0,
-                "agreement_adjustment": 0.0,
-                "agreement_gap": None,
-                "method": "instant_zero",
-            },
-            "final_reward": 0.0,
-            "method": "task_instant_zero" if task_grade else "j1_instant_zero",
-        }
+    final_score, blend_detail = blend_scores(
+        manual_score,
+        llm_score,
+        llm_confidence=(llm_verdict.confidence if llm_verdict is not None else None),
+        gate_multiplier=float(deterministic_detail["gate_multiplier"]),
+    )
 
-    llm_verdict: Optional[FinalVerdict] = None
-    if use_llm_judge and api_key and api_base_url:
-        try:
-            llm_verdict = run_llm_judge(
-                agent_output=agent_output,
-                tool_registry=tool_registry,
-                scenario=scenario,
-                step_context=step_context,
-                available_tools=available_tools,
-                previous_actions=previous_actions,
-                api_key=api_key,
-                api_base_url=api_base_url,
-                model=judge_model,
-            )
-        except Exception:
-            llm_verdict = None
-
-    llm_score: Optional[float] = None
-    blend_detail: Dict[str, Any]
-    if llm_verdict is not None:
-        if llm_verdict.instant_zero:
-            return 0.0, {
-                "manual_score": base_score,
-                "manual_reasons": j1_reasons,
-                "deterministic_grade": task_grade,
-                "llm_verdict": llm_verdict.model_dump(),
-                "llm_score": 0.0,
-                "final_reward": 0.0,
-                "method": "llm_instant_zero",
-            }
-        llm_score = llm_verdict.total_score
-        final, blend_detail = blend_scores(base_score, llm_score)
-        method = "combined_task_llm" if task_grade else "combined_manual_llm"
-    else:
-        final, blend_detail = blend_scores(base_score, None)
-        method = "task_only" if task_grade else "manual_only"
-
-    return final, {
-        "manual_score": base_score,
-        "manual_reasons": j1_reasons,
-        "deterministic_grade": task_grade,
-        "llm_verdict": llm_verdict.model_dump() if llm_verdict else None,
+    detail = {
+        "method": "stateful_checklist_grader",
+        "deterministic_score": deterministic_detail["deterministic_score"],
+        "semantic_score": deterministic_detail["semantic_score"],
+        "trajectory_score": deterministic_detail["trajectory_score"],
+        "manual_score": manual_score,
         "llm_score": llm_score,
+        "llm_verdict": llm_verdict.model_dump() if llm_verdict is not None else None,
         "blend_detail": blend_detail,
-        "final_reward": final,
-        "method": method,
+        "gate_multiplier": deterministic_detail["gate_multiplier"],
+        "failed_checks": deterministic_detail["failed_checks"],
+        "arg_errors": deterministic_detail["arg_errors"],
+        "hallucinated_args": deterministic_detail["hallucinated_args"],
+        "risk_flags": deterministic_detail["risk_flags"],
+        "hard_failure": deterministic_detail["hard_failure"],
+        "tips": deterministic_detail["tips"],
+        "passed_threshold": final_score >= step_contract.pass_threshold and not deterministic_detail["hard_failure"],
+        "pass_threshold": step_contract.pass_threshold,
+        "score_components": deterministic_detail["score_components"],
+        "state_delta": deterministic_detail["state_delta"],
+        "state_delta_components": deterministic_detail["state_delta_components"],
+        "final_reward": final_score,
     }
-
-
-
-# ──────────────────────────────────────────────
-#  Legacy stub functions for backward compatibility
-# ──────────────────────────────────────────────
-
-def score_reasoning(thinking: str, step: Any, shared_state: Dict) -> Tuple[float, Dict]:
-    """
-    Legacy function - scores reasoning quality.
-    Returns (score, breakdown_dict).
-    """
-    cleaned = (thinking or "").strip()
-    if not cleaned:
-        return 0.0, {
-            "word_count": 0,
-            "connector_hits": 0,
-            "keyword_hit_ratio": 0.0,
-            "context_hit_ratio": 0.0,
-            "strategic_signal_ratio": 0.0,
-            "placeholder_language": False,
-        }
-
-    words = cleaned.split()
-    lower = cleaned.lower()
-    connectors = sum(1 for kw in REASONING_KEYWORDS if kw in lower)
-    keyword_ratio = 0.0
-    context_ratio = 0.0
-    strategic_ratio = 0.0
-
-    optimal_keywords = getattr(step, "optimal_reasoning_keywords", []) or []
-    if optimal_keywords:
-        keyword_ratio = len([kw for kw in optimal_keywords if kw.lower() in lower]) / len(optimal_keywords)
-
-    context_tokens = _tokens(
-        f"{getattr(step, 'question', '')} {getattr(step, 'context', '')} "
-        f"{getattr(step, 'counterfactual_tip', '')}"
-    )
-    if context_tokens:
-        context_ratio = len(context_tokens & _tokens(cleaned)) / len(context_tokens)
-
-    strategic_hits = sum(1 for word in STRATEGIC_SIGNAL_WORDS if word in lower)
-    strategic_ratio = min(1.0, strategic_hits / 5)
-    placeholder_language = bool(PLACEHOLDER_PATTERN.search(cleaned))
-
-    score = 0.08
-    score += min(0.18, len(words) / 55 * 0.18)
-    score += min(0.16, connectors * 0.04)
-    score += min(0.28, keyword_ratio * 0.28)
-    score += min(0.14, context_ratio * 0.14)
-    score += min(0.16, strategic_ratio * 0.16)
-
-    if len(words) < 18:
-        score -= 0.10
-    if connectors == 0:
-        score -= 0.06
-    if placeholder_language:
-        score -= 0.25
-
-    return _clip(score), {
-        "word_count": len(words),
-        "connector_hits": connectors,
-        "keyword_hit_ratio": _clip(keyword_ratio),
-        "context_hit_ratio": _clip(context_ratio),
-        "strategic_signal_ratio": _clip(strategic_ratio),
-        "placeholder_language": placeholder_language,
-    }
-
-
-def score_tool_arguments(tool_name: str, tool_args: Dict, step: Any) -> Tuple[float, List[str], List[str]]:
-    """
-    Legacy function - scores tool arguments.
-    Returns (score, errors_list, hints_list).
-    """
-    errors = []
-    hints = []
-
-    if not tool_name:
-        errors.append("No tool specified")
-        return 0.0, errors, hints
-
-    required_tool = getattr(step, "required_tool", "")
-    if required_tool and tool_name != required_tool:
-        errors.append(f"Expected tool `{required_tool}`, got `{tool_name}`")
-
-    schema = TOOL_REGISTRY.get(tool_name)
-    arg_quality = 0.0
-    validation_ok = False
-    if schema is not None:
-        validation_ok, arg_errors, arg_quality = validate_args(schema, tool_args)
-        errors.extend(arg_errors)
-    else:
-        errors.append(f"No schema found for tool `{tool_name}`")
-
-    expected_args = getattr(step, "required_args_hints", {}) or {}
-    if expected_args:
-        provided_required = sum(1 for name in expected_args if name in tool_args and tool_args.get(name) not in (None, "", []))
-        coverage_ratio = provided_required / len(expected_args)
-    else:
-        coverage_ratio = 0.5 if tool_args else 0.0
-
-    optimal_args = getattr(step, "optimal_args", {}) or {}
-    if optimal_args:
-        semantic_scores = [_semantic_match(tool_args.get(key), expected) for key, expected in optimal_args.items()]
-        optimal_alignment = sum(semantic_scores) / len(semantic_scores)
-    else:
-        optimal_alignment = 0.5 if tool_args else 0.0
-
-    richness_scores = []
-    for value in tool_args.values():
-        if isinstance(value, str):
-            richness_scores.append(min(1.0, len(value.split()) / 10))
-        elif isinstance(value, (int, float)):
-            richness_scores.append(0.9)
-        else:
-            richness_scores.append(0.7)
-    arg_richness = sum(richness_scores) / len(richness_scores) if richness_scores else 0.0
-
-    tool_match_score = 1.0 if not required_tool or tool_name == required_tool else 0.12
-    score = (
-        tool_match_score * 0.40
-        + arg_quality * 0.20
-        + coverage_ratio * 0.20
-        + optimal_alignment * 0.15
-        + arg_richness * 0.05
-    )
-
-    if coverage_ratio < 0.75:
-        missing = [name for name in expected_args if name not in tool_args or tool_args.get(name) in (None, "", [])]
-        if missing:
-            hints.append(f"Add the missing core args: {', '.join(missing[:4])}")
-    if optimal_alignment < 0.65 and optimal_args:
-        hints.append("Match the step's expected direction more closely with scenario-specific values.")
-    if validation_ok and coverage_ratio >= 0.8:
-        hints.append("Argument structure is solid.")
-
-    return _clip(score), errors, hints
-
-
-def score_subagent_decision(used_subagent: bool, step: Any, subagent_result: Optional[str]) -> float:
-    """
-    Legacy function - scores subagent usage.
-    Returns score.
-    """
-    if not used_subagent:
-        return 0.5  # neutral
-    
-    if subagent_result and len(subagent_result) > 50:
-        return 0.8  # good usage
-    
-    return 0.6
-
-
-def compute_j1(reasoning_score: float, tool_arg_score: float, subagent_score: float, rubric_tier: str) -> float:
-    """
-    Legacy function - computes J1 score.
-    Returns combined score.
-    """
-    base = (reasoning_score * 0.45 + tool_arg_score * 0.45 + subagent_score * 0.10)
-    
-    tier_bonus = {
-        "excellent": 0.06,
-        "good": 0.03,
-        "acceptable": 0.0,
-        "poor": -0.06,
-    }.get(rubric_tier, 0.0)
-
-    return _clip(base + tier_bonus)
-
-
-def compute_j2(goal_achieved: bool, steps_used: int, max_steps: int, 
-               reasoning_avg: float = 0.5, strategy_diversity: float = 0.5,
-               cross_agent_actions: int = 0, efficiency: float = 0.5, 
-               shared_state: Dict = None) -> float:
-    """
-    Legacy function - computes J2 (episode-level) score.
-    Returns score.
-    """
-    if not goal_achieved:
-        return 0.0
-    
-    step_efficiency = 1.0 - (steps_used / max_steps) if max_steps > 0 else 0.5
-    
-    return (step_efficiency * 0.3 + reasoning_avg * 0.4 + strategy_diversity * 0.2 + min(cross_agent_actions / 5, 0.1))
-
-
-def auto_classify_rubric(reasoning_score: float, tool_arg_score: float) -> str:
-    """
-    Legacy function - classifies performance into rubric tier.
-    Returns tier string.
-    """
-    avg = (reasoning_score + tool_arg_score) / 2
-    
-    if avg >= 0.8:
-        return "excellent"
-    elif avg >= 0.6:
-        return "good"
-    elif avg >= 0.4:
-        return "acceptable"
-    else:
-        return "poor"
-
-
-def generate_counterfactual(step: Any, j1: float, reasoning_breakdown: Dict, tool_hints: List[str]) -> str:
-    """
-    Legacy function - generates counterfactual feedback.
-    Returns feedback string.
-    """
-    required_tool = getattr(step, "required_tool", "the expected tool")
-    connector_hits = reasoning_breakdown.get("connector_hits", 0)
-    keyword_ratio = reasoning_breakdown.get("keyword_hit_ratio", 0.0)
-
-    if j1 >= 0.8:
-        return (
-            f"Strong performance. Keep the same direction and sharpen the next move with explicit metrics, "
-            f"stakeholder impact, and why `{required_tool}` is still the right tool."
-        )
-    if j1 >= 0.6:
-        improvement = ", ".join(tool_hints[:2]) if tool_hints else "tighten the argument details and make the tradeoffs explicit"
-        return f"Solid attempt. To score higher, keep `{required_tool}` but {improvement}."
-    if j1 >= 0.4:
-        return (
-            f"Needs improvement. Your reasoning only showed {connector_hits} structured connectors and "
-            f"{keyword_ratio:.2f} keyword alignment. Use `{required_tool}` with more scenario-specific numbers, risks, and success criteria."
-        )
-    return (
-        f"Low-scoring move. Re-anchor on the step objective, use `{required_tool}` if appropriate, and answer with "
-        "complete args, explicit tradeoffs, concrete metrics, and direct scenario grounding."
-    )
+    if llm_verdict is not None:
+        detail["judge_feedback"] = llm_verdict.overall_feedback
+        detail["judge_tips"] = llm_verdict.improvement_tips
+    return final_score, detail

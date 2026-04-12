@@ -1,5 +1,5 @@
 ---
-title: Hackathon OpenEnv
+title: AGENT OS
 emoji: "🧭"
 colorFrom: red
 colorTo: yellow
@@ -9,17 +9,25 @@ pinned: false
 license: bsd-3-clause
 ---
 
-# Hackathon OpenEnv
+# AGENT OS
 
-Hackathon OpenEnv is a deployment-ready OpenEnv benchmark for strategic business decision making. It now aligns the repo around a typed FastAPI/OpenEnv server, a deterministic benchmark task set, a stronger reward + grader pipeline, and a root-level `inference.py` that produces reproducible scores and strict `[START]`, `[STEP]`, `[END]` stdout lines.
+AGENT OS is a deployment-ready OpenEnv benchmark for strategic business decision making. The repository is organized around a single shared benchmark engine, a typed OpenEnv server, a stronger deterministic-plus-LLM reward system, and a root-level `inference.py` that emits the required `[START]`, `[STEP]`, and `[END]` logs.
 
-## What Changed
+## Repository Layout
 
-- `reset()`, `step()`, and `state` now follow the installed OpenEnv interface directly.
-- The root Space URL returns `200` with a working control surface instead of a blank / 404 landing page.
-- Four benchmark tasks are exposed through `/tasks`, with deterministic graders and rewards in the `0.0` to `1.0` range.
-- The judge path supports OpenAI-compatible endpoints via `API_BASE_URL`, `MODEL_NAME`, and `API_KEY`.
-- The repository includes both a root `Dockerfile` for Hugging Face Spaces and the expected root `inference.py`.
+The repo is intentionally kept flat for import stability and hackathon deployment simplicity. The main areas are:
+
+- `app.py`: AGENT OS Gradio UI.
+- `server/`: Space and API entrypoints for deployment.
+- `benchmark_engine.py`: shared state machine used by both the UI and OpenEnv environment.
+- `hackathon_environment.py`: benchmark environment implementation.
+- `reward_engine.py` and `judge_engine.py`: deterministic scoring and bounded LLM judging.
+- `tool_schemas.py`: strict tool and argument validation.
+- `benchmark_tasks.py`, `agents.py`, `situations.py`, `domains.py`: scenario catalog and task assembly.
+- `inference.py`: required submission baseline script.
+- `tests/`: regression coverage for leakage, scoring, progression, and proxy usage.
+- `validate_local.py`: local end-to-end validation harness.
+- `outputs/`: generated validation and scoring artifacts, recreated on demand.
 
 ## Required Environment Variables
 
@@ -29,14 +37,22 @@ Before submitting, define these variables in the Space or runtime configuration:
 - `MODEL_NAME`: the model name used for inference and optional judging.
 - `API_KEY`: the API key used by the OpenAI client.
 
-## Benchmark Tasks
+## Benchmark Overview
 
-The environment currently ships with four graded tasks:
+The environment currently ships with twelve graded canonical tasks:
 
-- `startup_ceo_fundraise`
-- `startup_cto_scale`
-- `pharma_cso_signal`
-- `healthcare_cmo_safety`
+- `ceo_fundraise_or_default`
+- `cfr_burn_crisis`
+- `cmo_category_creation`
+- `cmo_social_crisis`
+- `cmo_wrong_medication`
+- `cso_safety_signal`
+- `cto_scale_crisis`
+- `ecom_ceo_brand_or_amazon`
+- `hospital_ceo_insurance_battle`
+- `pharma_ceo_bigpharma_offer`
+- `pm_roadmap_vs_enterprise`
+- `reg_nda_strategy`
 
 Each task exposes:
 
@@ -44,10 +60,31 @@ Each task exposes:
 - a typed observation model
 - a typed state model
 - a role-specific tool registry
-- deterministic task grading
-- optional LLM judging layered on top
+- a leak-free public task description
+- deterministic checklist grading with risk gates
+- optional bounded LLM semantic judging layered on top
 
-## Local Validation
+## Quick Start
+
+Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+Run the AGENT OS UI locally:
+
+```bash
+python app.py
+```
+
+Run the API server locally:
+
+```bash
+python -m server.app --host 0.0.0.0 --port 7860
+```
+
+## Validation
 
 Run the OpenEnv validator:
 
@@ -89,11 +126,24 @@ python inference.py
 
 The script:
 
-- enumerates all benchmark tasks
+- enumerates all canonical benchmark tasks
 - emits strict `[START]`, `[STEP]`, and `[END]` structured logs
 - writes reproducible scores to `outputs/baseline_scores.json`
 - uses the OpenAI client when `API_BASE_URL`, `MODEL_NAME`, and `API_KEY` are available
+- performs bounded retry-and-revise loops before advancing phases
 - falls back to a deterministic benchmark reasoning policy if the LLM is unavailable
+
+## Generated Artifacts
+
+These files are generated locally and can be safely deleted at any time:
+
+- `outputs/baseline_scores.json`
+- `outputs/adversarial_regressions.json`
+- `outputs/judge_consistency_report.json`
+- `outputs/validation_report.json`
+- `__pycache__/`
+- `.pytest_cache/`
+- `*.egg-info/`
 
 ## Docker
 
@@ -124,4 +174,4 @@ This repository is configured as a Docker Space and listens on port `7860`. The 
 - `/metadata`
 - `/health`
 
-The root page is a lightweight control surface so automated pings to the Space URL get a valid `200` response before interacting with the environment API.
+The root page is the AGENT OS control surface so automated pings to the Space URL get a valid `200` response before interacting with the environment API.
